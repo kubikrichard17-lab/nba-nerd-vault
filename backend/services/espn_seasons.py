@@ -20,6 +20,8 @@ bez ní by jeden profil znamenal 20 požadavků.
 from __future__ import annotations
 
 import logging
+import re
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
@@ -167,12 +169,59 @@ def _to_row(season_id: str, values: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
+def _plain(text: Any) -> str:
+    """Jméno bez diakritiky, mezer a interpunkce (Dončić → doncic)."""
+    t = unicodedata.normalize("NFKD", str(text)).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-z]", "", t.lower())
+
+
+def resolve_id(nba_id: int) -> int:
+    """
+    Přeloží NBA ID hráče na ID v ESPN (jsou jiná: LeBron 2544 → 1966).
+
+    Jméno se vezme z registru NBA a dohledá přes vyhledávání ESPN;
+    bere se jen přesná shoda jména v NBA. Když se nenajde, vrátí původní ID.
+    """
+    def _do() -> int:
+        name = None
+        try:
+            from nba_api.stats.static import players
+
+            for pl in players.get_players():
+                if int(pl["id"]) == int(nba_id):
+                    name = pl["full_name"]
+                    break
+        except Exception:
+            return int(nba_id)
+        if not name:
+            return int(nba_id)
+        from urllib.parse import quote
+
+        data = _get_json(
+            "https://site.web.api.espn.com/apis/search/v2?limit=10&type=player&query=" + quote(name)
+        )
+        want = _plain(name)
+        for res in (data or {}).get("results") or []:
+            for item in res.get("contents") or []:
+                if item.get("type") != "player" or str(item.get("description")) != "NBA":
+                    continue
+                if _plain(item.get("displayName", "")) != want:
+                    continue
+                m = re.search(r"a:(\d+)", str(item.get("uid", "")))
+                if m:
+                    return int(m.group(1))
+        return int(nba_id)
+
+    return _cached(f"resolve:{nba_id}", _do)
+
+
 def player_season_stats(player_id: int) -> Optional[List[Dict[str, Any]]]:
     """
     Všechny sezóny hráče podle ESPN, ve tvaru jako z nba_api.
 
     Vrací None, když ESPN hráče nezná. Pořadí je od nejstarší sezóny.
     """
+    player_id = resolve_id(player_id)
 
     def load() -> Optional[List[Dict[str, Any]]]:
         log = _get_json(f"{ESPN_BASE}/athletes/{player_id}/statisticslog")
@@ -223,6 +272,7 @@ def career_stats(player_id: int) -> Optional[Dict[str, Any]]:
     Používá se jako náhrada, když NBA API neodpovídá a Basketball-Reference
     nestačí. Vrací i pozici a míry, protože je má ve stejném dokumentu.
     """
+    player_id = resolve_id(player_id)
 
     def load() -> Optional[Dict[str, Any]]:
         data = _get_json(f"{ESPN_BASE}/athletes/{player_id}")
@@ -268,6 +318,7 @@ def last_game(player_id: int) -> Optional[Dict[str, Any]]:
 
     Vrací stejný tvar jako `/api/players/{id}/last-game`.
     """
+    player_id = resolve_id(player_id)
 
     def load() -> Optional[Dict[str, Any]]:
         data = _get_json(GAMELOG_URL.format(id=player_id))
