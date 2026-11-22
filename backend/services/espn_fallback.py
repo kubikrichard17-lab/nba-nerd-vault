@@ -340,6 +340,22 @@ def _id_from_ref(ref: str) -> int:
         return 0
 
 
+# statistiky týmu v zápase, které ESPN posílá ve skóreboardu
+_TEAM_STAT = {
+    "rebounds": "reb",
+    "assists": "ast",
+    "fieldGoalsMade": "fgm",
+    "fieldGoalsAttempted": "fga",
+    "threePointFieldGoalsMade": "fg3m",
+    "threePointFieldGoalsAttempted": "fg3a",
+    "freeThrowsMade": "ftm",
+    "freeThrowsAttempted": "fta",
+    "turnovers": "tov",
+    "steals": "stl",
+    "blocks": "blk",
+}
+
+
 def scoreboard(date_str: str, day_offset: int, team_cz: Dict[str, str]) -> Optional[Dict[str, Any]]:
     """
     Rozpis a výsledky na den – stejný tvar jako `nba_news.get_schedule()`.
@@ -373,12 +389,23 @@ def scoreboard(date_str: str, day_offset: int, team_cz: Dict[str, str]) -> Optio
                     record = str(rec.get("summary") or "")
                     break
             wins, losses = _split_record(record)
+            # Statistiky ze skóreboardu jsou jen u dohraného zápasu; jinde
+            # tam jsou sezónní součty týmu, což by byla lež – proto se berou
+            # jen tehdy, když zápas skončil.
+            stats: Dict[str, int] = {}
+            if str(((comp.get("status") or {}).get("type") or {}).get("state")) == "post":
+                for stat in competitor.get("statistics") or []:
+                    key = _TEAM_STAT.get(str(stat.get("name") or ""))
+                    if key:
+                        raw = stat.get("displayValue")
+                        stats[key] = int(_num(str(raw).split("-")[0] if raw else 0))
             sides[side] = {
                 "abbr": abbr,
                 "name": team_cz.get(abbr, team.get("displayName") or abbr),
                 "wins": wins,
                 "losses": losses,
                 "score": int(_num(scores)) if scores is not None else None,
+                "stats": stats,
             }
         if not sides["home"] or not sides["away"]:
             continue
