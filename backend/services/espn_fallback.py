@@ -224,6 +224,36 @@ def _team_abbr(team_id: int, year: int) -> str:
     return abbr
 
 
+_GP_CACHE: Dict[str, int] = {}
+
+
+def _athlete_gp(athlete_id: Optional[int], year: int) -> int:
+    """
+    Počet odehraných zápasů hráče v sezóně.
+
+    Bez toho se v žebříčku ukazovalo 0 zápasů u všech hráčů – a protože se
+    průměr počítá jen od určitého počtu zápasů, vypadalo to jako chyba.
+    """
+    if not athlete_id:
+        return 0
+    key = f"{athlete_id}:{year}"
+    if key in _GP_CACHE:
+        return _GP_CACHE[key]
+    data = _get_json(
+        "https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba"
+        f"/seasons/{year}/types/2/athletes/{athlete_id}/statistics/0"
+    )
+    gp = 0
+    if data:
+        for cat in ((data.get("splits") or {}).get("categories")) or []:
+            for stat in cat.get("stats") or []:
+                if stat.get("name") == "gamesPlayed":
+                    gp = int(_num(stat.get("value")))
+                    break
+    _GP_CACHE[key] = gp
+    return gp
+
+
 def leaders(
     season: str,
     stat: str,
@@ -260,13 +290,16 @@ def leaders(
     athlete_ids = [_id_from_ref((e.get("athlete") or {}).get("$ref") or "") for e in entries]
     team_ids = [_id_from_ref((e.get("team") or {}).get("$ref") or "") for e in entries]
 
-    # jména a týmy paralelně – sériově to trvalo 20 s
+    # jména, týmy a počet zápasů paralelně – sériově to trvalo 20 s
     with ThreadPoolExecutor(max_workers=12) as pool:
         names = list(pool.map(lambda i: _athlete_name(i, year) if i else "", athlete_ids))
         abbrs = list(pool.map(lambda i: _team_abbr(i, year) if i else "", team_ids))
+        games = list(pool.map(lambda i: _athlete_gp(i, year) if i else 0, athlete_ids))
 
     rows: List[Dict[str, Any]] = []
-    for entry, athlete_id, team_id, name, abbr in zip(entries, athlete_ids, team_ids, names, abbrs):
+    for entry, athlete_id, team_id, name, abbr, gp in zip(
+        entries, athlete_ids, team_ids, names, abbrs, games
+    ):
         value = entry.get("value")
         if value is None:
             value = _num(entry.get("displayValue"))
@@ -280,7 +313,7 @@ def leaders(
                 "name": name,
                 "team": abbr,
                 "team_name": team_cz.get(abbr, abbr),
-                "gp": 0,
+                "gp": gp,
                 "season": season,
                 "season_span": season,
                 "value": round(value, 3 if stat.endswith("_PCT") else 1),
