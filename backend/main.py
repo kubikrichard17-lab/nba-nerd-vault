@@ -817,6 +817,16 @@ def get_closest_player(
 @app.get("/api/players/{player_id}/last-game")
 def get_last_game(player_id: int):
     """Return stats from the player's last played game using NBA API PlayerGameLog."""
+    from services import source_switch
+
+    if source_switch.espn_first():
+        from services import espn_seasons
+
+        fallback = espn_seasons.last_game(player_id)
+        if fallback:
+            return _json_safe(fallback)
+        raise HTTPException(status_code=404, detail="Hráč nemá žádné záznamy o zápasech.")
+
     try:
         from nba_api.stats.endpoints import playergamelog
         from nba_api.stats.library.parameters import SeasonAll
