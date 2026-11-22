@@ -572,6 +572,24 @@ def _player_from_espn(player_id: int, db: Session) -> Optional[Player]:
     return player
 
 
+_NBA_DOWN_UNTIL = 0.0
+_NBA_DOWN_SECONDS = 600
+
+
+def _nba_is_down() -> bool:
+    """True, když NBA API před chvílí selhalo (nebo je vynucen ESPN přes env)."""
+    import os
+
+    if os.environ.get("NBA_DATA_SOURCE", "").lower() == "espn":
+        return True
+    return time.time() < _NBA_DOWN_UNTIL
+
+
+def _nba_mark(ok: bool) -> None:
+    global _NBA_DOWN_UNTIL
+    _NBA_DOWN_UNTIL = 0.0 if ok else time.time() + _NBA_DOWN_SECONDS
+
+
 def fetch_and_cache_player(player_id: int, db: Session) -> Optional[Player]:
     """Load player from SQLite database. If missing, fetch from NBA API and cache."""
     # Check cache first
@@ -606,7 +624,10 @@ def fetch_and_cache_player(player_id: int, db: Session) -> Optional[Player]:
         # Dřív se profil nového hráče načítal 72 s, teď se do 20 s sáhne po ESPN.
         info_df = None
         last_error: Optional[Exception] = None
-        for attempt in range(NBA_INFO_ATTEMPTS):
+        # Jistič: když NBA API před chvílí nezabralo (typicky na Renderu),
+        # nečeká se na ně znovu – rovnou se jde na ESPN. Zkusí se zas po 10 min.
+        nba_attempts = 0 if _nba_is_down() else NBA_INFO_ATTEMPTS
+        for attempt in range(nba_attempts):
             try:
                 info_endpoint = commonplayerinfo.CommonPlayerInfo(
                     player_id=player_id, timeout=NBA_INFO_TIMEOUT
@@ -617,6 +638,11 @@ def fetch_and_cache_player(player_id: int, db: Session) -> Optional[Player]:
             except Exception as exc:  # pragma: no cover
                 last_error = exc
                 time.sleep(1.0 * (attempt + 1))
+
+        if info_df is not None and not info_df.empty:
+            _nba_mark(True)
+        elif nba_attempts:
+            _nba_mark(False)
 
         if info_df is None or info_df.empty:
             logger.error(
