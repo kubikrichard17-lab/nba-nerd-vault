@@ -336,10 +336,9 @@ ESPN_SUMMARY = "https://site.api.espn.com/apis/site/v2/sports/basketball/nba/sum
 
 def game_summary(event_id: str) -> Optional[Dict[str, Any]]:
     """
-    Boxscore jednoho zápasu (statistiky hráčů obou týmů).
-
-    Vrací stejný tvar jako `/api/news/games/{game_id}`:
-    `{game_id, game_date, home: {...}, away: {...}, players: [...]}`.
+    Boxscore jednoho zápasu z ESPN ve stejném tvaru jako NBA verze
+    (`teams[].players`, `teams[].totals`, `team_totals`) – podle toho se
+    kreslí stránka Novinky. Funguje i pro probíhající zápas.
     """
     if not event_id:
         return None
@@ -347,73 +346,85 @@ def game_summary(event_id: str) -> Optional[Dict[str, Any]]:
     if not data:
         return None
 
-    header = data.get("header") or {}
-    competitions = header.get("competitions") or []
-    comp = competitions[0] if competitions else {}
-    date = str(comp.get("date") or "")[:10]
+    comp = ((data.get("header") or {}).get("competitions") or [{}])[0]
+    state = str((((comp.get("status") or {}).get("type")) or {}).get("state") or "")
+    score: Dict[str, int] = {}
+    names: Dict[str, str] = {}
+    for c in comp.get("competitors") or []:
+        t = c.get("team") or {}
+        ab = str(t.get("abbreviation") or "").upper()
+        score[ab] = _to_int(c.get("score"))
+        names[ab] = str(t.get("displayName") or ab)
 
-    # jména a zkratky týmů
-    teams: Dict[str, Dict[str, str]] = {}
-    for competitor in comp.get("competitors") or []:
-        team = competitor.get("team") or {}
-        abbr = str(team.get("abbreviation") or "").upper()
-        teams[abbr] = {
-            "abbr": abbr,
-            "name": team.get("displayName") or abbr,
-            "home_away": str(competitor.get("homeAway") or ""),
-            "score": competitor.get("score"),
-        }
-    if len(teams) < 2:
-        return None
+    def split(v: Any) -> tuple:
+        left, _, right = str(v or "0-0").partition("-")
+        return _to_int(left), _to_int(right)
 
-    players: List[Dict[str, Any]] = []
-    for block in data.get("boxscore", {}).get("players") or []:
-        team = block.get("team") or {}
-        abbr = str(team.get("abbreviation") or "").upper()
+    def pct(m: int, a: int) -> float:
+        return round(m / a, 3) if a else 0.0
+
+    teams: List[Dict[str, Any]] = []
+    totals_all: List[Dict[str, Any]] = []
+    for block in (data.get("boxscore") or {}).get("players") or []:
+        ab = str((block.get("team") or {}).get("abbreviation") or "").upper()
+        players: List[Dict[str, Any]] = []
         for group in block.get("statistics") or []:
-            keys = [str(k) for k in (group.get("names") or group.get("labels") or [])]
-            for athlete in group.get("athletes") or []:
-                info = athlete.get("athlete") or {}
-                stats = athlete.get("stats") or []
-                row = {key.lower(): stats[i] for i, key in enumerate(keys) if i < len(stats)}
+            keys = [str(k).upper() for k in (group.get("labels") or group.get("names") or [])]
+            for ath in group.get("athletes") or []:
+                info = ath.get("athlete") or {}
+                st = ath.get("stats") or []
+                row = {k: st[i] for i, k in enumerate(keys) if i < len(st)}
                 if not row:
                     continue
-                players.append(
-                    {
-                        "player_id": _num(info.get("id")),
-                        "name": info.get("displayName") or info.get("shortName") or "",
-                        "team": abbr,
-                        "minutes": row.get("min", "0"),
-                        "pts": _to_int(row.get("pts")),
-                        "reb": _to_int(row.get("reb")),
-                        "ast": _to_int(row.get("ast")),
-                        "stl": _to_int(row.get("stl")),
-                        "blk": _to_int(row.get("blk")),
-                        "tov": _to_int(row.get("to")),
-                        "fgm": _to_int(str(row.get("fg") or "0").split("-")[0]),
-                        "fga": _to_int(str(row.get("fg") or "0-0").split("-")[-1]),
-                        "fg3m": _to_int(str(row.get("3pt") or "0").split("-")[0]),
-                        "fg3a": _to_int(str(row.get("3pt") or "0-0").split("-")[-1]),
-                        "ftm": _to_int(str(row.get("ft") or "0").split("-")[0]),
-                        "fta": _to_int(str(row.get("ft") or "0-0").split("-")[-1]),
-                    }
-                )
+                fgm, fga = split(row.get("FG"))
+                f3m, f3a = split(row.get("3PT"))
+                ftm, fta = split(row.get("FT"))
+                reb = _to_int(row.get("REB"))
+                oreb = _to_int(row.get("OREB"))
+                pm = str(row.get("+/-") or "0").replace("+", "")
+                players.append({
+                    "player_id": _to_int(info.get("id")),
+                    "name": str(info.get("displayName") or info.get("shortName") or ""),
+                    "team": ab,
+                    "position": str((info.get("position") or {}).get("abbreviation") or ""),
+                    "starter": bool(ath.get("starter")),
+                    "minutes": str(row.get("MIN") or "0"),
+                    "pts": _to_int(row.get("PTS")),
+                    "reb": reb, "oreb": oreb, "dreb": max(reb - oreb, 0),
+                    "ast": _to_int(row.get("AST")),
+                    "stl": _to_int(row.get("STL")),
+                    "blk": _to_int(row.get("BLK")),
+                    "tov": _to_int(row.get("TO")),
+                    "pf": _to_int(row.get("PF")),
+                    "fgm": fgm, "fga": fga, "fg_pct": pct(fgm, fga),
+                    "fg3m": f3m, "fg3a": f3a, "fg3_pct": pct(f3m, f3a),
+                    "ftm": ftm, "fta": fta, "ft_pct": pct(ftm, fta),
+                    "plus_minus": float(_num(pm)),
+                    "comment": "" if ath.get("didNotPlay") is None else ("DNP" if ath.get("didNotPlay") else ""),
+                })
+        if not players:
+            continue
+        players.sort(key=lambda x: (0 if x["starter"] else 1, -x["pts"]))
+        tot = {"team": ab, "name": names.get(ab, ab), "minutes": "240:00"}
+        for f in ("pts", "reb", "ast", "stl", "blk", "tov", "pf", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta"):
+            tot[f] = sum(p[f] for p in players)
+        if score.get(ab):
+            tot["pts"] = score[ab]
+        tot["fg_pct"] = pct(tot["fgm"], tot["fga"])
+        tot["fg3_pct"] = pct(tot["fg3m"], tot["fg3a"])
+        tot["ft_pct"] = pct(tot["ftm"], tot["fta"])
+        totals_all.append(tot)
+        teams.append({"abbr": ab, "name": names.get(ab, ab), "players": players, "totals": tot, "pts": tot["pts"]})
 
-    if not players:
+    if not teams:
         return None
-
-    home = next((t for t in teams.values() if t["home_away"] == "home"), None)
-    away = next((t for t in teams.values() if t["home_away"] == "away"), None)
-    if not home or not away:
-        home, away = list(teams.values())[:2]
-
+    teams.sort(key=lambda t: -t["pts"])
     return {
         "game_id": event_id,
-        "game_date": date,
-        "home": {"abbr": home["abbr"], "name": home["name"], "pts": _to_int(home["score"])},
-        "away": {"abbr": away["abbr"], "name": away["name"], "pts": _to_int(away["score"])},
-        "players": players,
-        "source": "ESPN (záložní zdroj – NBA API z tohoto serveru neodpovídá)",
+        "teams": teams,
+        "team_totals": totals_all,
+        "live": state == "in",
+        "source": "ESPN",
     }
 
 
