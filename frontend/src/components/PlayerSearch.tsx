@@ -161,10 +161,12 @@ export const PlayerSearch: React.FC<PlayerSearchProps> = ({
                     </div>
                     <div className="text-xs text-slate-400 flex items-center gap-2">
                       <span>ID: {player.id}</span>
-                      <span>•</span>
-                      <span className={player.is_active ? 'text-emerald-400' : 'text-slate-500'}>
-                        {player.is_active ? 'Aktivní hráč NBA' : 'Bývalý hráč NBA'}
-                      </span>
+                      {player.is_active && (
+                        <>
+                          <span>•</span>
+                          <span className="text-emerald-400">Aktivní hráč NBA</span>
+                        </>
+                      )}
                     </div>
                   </div>
                 </div>
