@@ -40,7 +40,12 @@ LEADERS_TTL = 3600 * 3   # 3 hodiny – sezónní žebříčky
 
 
 def _retry(call, attempts: int = 3, what: str = "data"):
-    """NBA API občas zahodí spojení – zkusíme to víckrát."""
+    """
+    NBA API občas zahodí spojení nebo odpovídá pomalu – zkusíme to víckrát.
+
+    Na malém serveru (Render free) je první požadavek po uspání služby
+    mnohem pomalejší, proto se mezi pokusy čeká déle než dřív.
+    """
     last: Optional[Exception] = None
     for attempt in range(attempts):
         try:
@@ -48,7 +53,8 @@ def _retry(call, attempts: int = 3, what: str = "data"):
         except Exception as exc:  # pragma: no cover
             last = exc
             logger.warning("Načítání %s – pokus %s selhal: %s", what, attempt + 1, exc)
-            time.sleep(1.5 + attempt * 2.5)
+            if attempt < attempts - 1:
+                time.sleep(2.0 + attempt * 3.0)
     raise last  # type: ignore[misc]
 
 
@@ -301,12 +307,15 @@ def _fetch_team_game_log(season: str) -> List[Dict[str, Any]]:
             season=season,
             season_type_all_star="Regular Season",
             player_or_team_abbreviation="T",
-            timeout=25,
+            timeout=20,
         )
         df = endpoint.get_data_frames()[0]
     except Exception as exc:  # pragma: no cover – síťová chyba
         logger.error("Nelze načíst LeagueGameLog pro sezónu %s: %s", season, exc)
-        raise NewsDataError(f"Výsledky zápasů sezóny {season} se nepodařilo načíst z NBA API.") from exc
+        # Prázdný seznam = tabulka se sestaví, jen bez formy posledních zápasů.
+        # Dřív tu výjimka letěla dál a shodila i /api/standings, i když
+        # samotná tabulka se načíst povedla.
+        return _cache_set(key, [])
 
     if df is None or df.empty:
         return _cache_set(key, [])
