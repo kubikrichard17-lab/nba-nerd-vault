@@ -1,22 +1,27 @@
 # Python knihovny pro backend (Render)
+#
+# Verze jsou záměrně BEZ připíchnutí (==). Důvod: Render na free tarifu
+# staví na 0,1 CPU a staré verze pandas/scikit-learn se musí kompilovat
+# ze zdrojového kódu (16+ minut, build padá). Aktuální verze mají hotové
+# balíčky (wheels) pro Python 3.11, takže se jen stáhnou a build je rychlý.
 
 # Webový server a API
-fastapi==0.115.6
-uvicorn[standard]==0.34.0
-pydantic==2.10.4
+fastapi>=0.115,<1.0
+uvicorn[standard]>=0.34,<1.0
+pydantic>=2.10,<3.0
 
 # Databáze
-SQLAlchemy==2.0.36
+SQLAlchemy>=2.0,<3.0
 
 # Data a výpočty
-numpy==1.26.4
-pandas==2.2.3
-scikit-learn==1.6.0
+numpy>=2.0,<3.0
+pandas>=2.2,<4.0
+scikit-learn>=1.6,<2.0
 
 # NBA data a HTTP
-nba_api==1.9.0
-requests==2.32.3
+nba_api>=1.9,<2.0
+requests>=2.32,<3.0
 
 # Volitelné: AI scouting report (když je nastavený GEMINI_API_KEY).
 # Bez klíče aplikace použije vlastní texty, nic nespadne.
-google-genai==0.8.3
+google-genai>=0.8,<2.0
