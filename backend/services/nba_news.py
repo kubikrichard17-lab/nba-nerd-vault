@@ -39,6 +39,20 @@ BOXSCORE_TTL = 3600 * 6  # 6 hodin – odehraný zápas se už nemění
 LEADERS_TTL = 3600 * 3   # 3 hodiny – sezónní žebříčky
 
 
+def _espn():
+    """
+    Záložní zdroj (ESPN) – importuje se líně, aby aplikace fungovala
+    i bez něj, kdyby modul chyběl.
+    """
+    try:
+        from services import espn_fallback
+
+        return espn_fallback
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Záložní zdroj ESPN není dostupný: %s", exc)
+        return None
+
+
 def _retry(call, attempts: int = 3, what: str = "data"):
     """
     NBA API občas zahodí spojení nebo odpovídá pomalu – zkusíme to víckrát.
@@ -481,8 +495,15 @@ def get_schedule(day_offset: int = 0) -> Dict[str, Any]:
         )
         frames = endpoint.get_data_frames()
     except Exception as exc:  # pragma: no cover
-        logger.error("Rozpis na %s se nepodařilo načíst: %s", date_str, exc)
-        raise NewsDataError("Rozpis zápasů se nepodařilo načíst z NBA API (zkus to za chvíli znovu).")
+        logger.warning("Rozpis na %s z NBA API nešel (%s), zkouším ESPN", date_str, exc)
+        espn = _espn()
+        payload = espn.scoreboard(date_str, day_offset, TEAM_CZ) if espn else None
+        if payload is not None:
+            logger.info("Rozpis %s načten ze záložního zdroje ESPN", date_str)
+            return _cache_set(key, payload)
+        raise NewsDataError(
+            "Rozpis zápasů se nepodařilo načíst ani z NBA API, ani ze záložního zdroje."
+        ) from exc
 
     games_df = frames[1] if len(frames) > 1 else None
     teams_df = frames[2] if len(frames) > 2 else None
@@ -1068,9 +1089,32 @@ def get_leaders(
                     what=f"sezóna {season}",
                 )
             except Exception as exc:  # pragma: no cover
-                logger.error("Sezónní lídři (%s, %s) selhali: %s", season, stat, exc)
+                logger.warning(
+                    "Sezónní lídři (%s, %s) z NBA API nešli (%s), zkouším ESPN", season, stat, exc
+                )
+                espn = _espn()
+                espn_rows = espn.leaders(season, stat, per_game, limit, TEAM_CZ) if espn else None
+                if espn_rows:
+                    note = (
+                        "Data jsou ze záložního zdroje ESPN – NBA API z tohoto serveru "
+                        "neodpovídá. Hodnoty jsou stejné jako v NBA (body, doskoky, …)."
+                    )
+                    payload = {
+                        "mode": mode,
+                        "stat": stat,
+                        "stat_label": def_info["label"],
+                        "per_game": per_game,
+                        "season": season,
+                        "team": None,
+                        "team_name": None,
+                        "title": f"Lídři sezóny {season} – {def_info['label']}",
+                        "note": note,
+                        "rows": espn_rows,
+                        "source": {"season": "ESPN (záložní zdroj)"},
+                    }
+                    return _cache_set(key, payload)
                 raise NewsDataError(
-                    f"Sezónní žebříčky {season} se nepodařilo načíst z NBA API (zkus to za chvíli znovu)."
+                    f"Sezónní žebříčky {season} se nepodařilo načíst ani z NBA API, ani z ESPN."
                 ) from exc
             _cache_set(season_key, df)
 
@@ -1145,9 +1189,14 @@ def get_standings(season: Optional[str] = None) -> Dict[str, Any]:
             what=f"tabulka {season}",
         )
     except Exception as exc:  # pragma: no cover
-        logger.error("Tabulka %s se nepodařila načíst: %s", season, exc)
+        logger.warning("Tabulka %s z NBA API nešla (%s), zkouším ESPN", season, exc)
+        espn = _espn()
+        payload = espn.standings(season, TEAM_CZ) if espn else None
+        if payload:
+            logger.info("Tabulka %s načtena ze záložního zdroje ESPN", season)
+            return _cache_set(key, payload)
         raise NewsDataError(
-            f"Tabulku sezóny {season} se nepodařilo načíst z NBA API (zkus to za chvíli znovu)."
+            f"Tabulku sezóny {season} se nepodařilo načíst ani z NBA API, ani ze záložního zdroje."
         ) from exc
 
     from nba_api.stats.static import teams as static_teams
