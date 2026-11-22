@@ -163,7 +163,7 @@ export const PlayerSearch: React.FC<PlayerSearchProps> = ({
                       <span>ID: {player.id}</span>
                       <span>•</span>
                       <span className={player.is_active ? 'text-emerald-400' : 'text-slate-500'}>
-                        {player.is_active ? 'Aktivní hráč NBA' : 'Historická legenda'}
+                        {player.is_active ? 'Aktivní hráč NBA' : 'Bývalý hráč NBA'}
                       </span>
                     </div>
                   </div>
