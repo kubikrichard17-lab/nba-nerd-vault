@@ -37,15 +37,11 @@ export const PlayerInfobox: React.FC<PlayerInfoboxProps> = ({ player }) => {
           <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-bold bg-orange-500/20 text-orange-400 border border-orange-500/30">
             {player.position || 'G/F'}
           </span>
-          <span
-            className={`inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold ${
-              player.is_active
-                ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
-                : 'bg-slate-800 text-slate-400 border border-slate-700'
-            }`}
-          >
-            {player.is_active ? 'Aktivní v NBA' : 'Bývalý hráč NBA'}
-          </span>
+          {player.is_active && (
+            <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-emerald-500/20 text-emerald-400 border border-emerald-500/30">
+              Aktivní v NBA
+            </span>
+          )}
         </div>
       </div>
 
