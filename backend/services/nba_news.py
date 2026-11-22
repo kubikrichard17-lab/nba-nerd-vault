@@ -859,7 +859,10 @@ def _normalize_abbr(abbr: str) -> str:
 def get_game_boxscore(game_id: str) -> Dict[str, Any]:
     """Boxscore zápasu – statistiky všech hráčů rozdělené po týmech."""
     game_id = str(game_id or "").strip()
-    if not game_id.isdigit() or len(game_id) < 8:
+    # Naše ID zápasu vypadá jako 'PORNY401910024' (zkratky obou týmů + číslo),
+    # takže samé číslice být nemusí. Kontroluje se jen rozumná délka a to,
+    # že v ID nejsou divné znaky.
+    if len(game_id) < 8 or len(game_id) > 24 or not game_id.replace("-", "").isalnum():
         raise NewsDataError("Neplatné ID zápasu.")
 
     key = f"boxscore:{game_id}"
