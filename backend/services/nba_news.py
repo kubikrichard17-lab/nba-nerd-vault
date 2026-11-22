@@ -53,12 +53,20 @@ def _espn():
         return None
 
 
-def _retry(call, attempts: int = 3, what: str = "data"):
-    """
-    NBA API občas zahodí spojení nebo odpovídá pomalu – zkusíme to víckrát.
+# Jak dlouho se čeká, než se to vzdá a sáhne po záložním zdroji.
+# Dřív to byly 3 pokusy po 30 s = 98 s, což je nad limitem prohlížeče
+# i Vercelu – stránka se načetla prázdná. Teď: 2 pokusy, první 20 s.
+NBA_PRIMARY_TIMEOUT = 20
+NBA_PRIMARY_ATTEMPTS = 2
 
-    Na malém serveru (Render free) je první požadavek po uspání služby
-    mnohem pomalejší, proto se mezi pokusy čeká déle než dřív.
+
+def _retry(call, attempts: int = NBA_PRIMARY_ATTEMPTS, what: str = "data"):
+    """
+    NBA API občas zahodí spojení nebo neodpovídá vůbec.
+
+    Důležité: když NBA neodpovídá (blokace z cloudu), nemá smysl čekat
+    minutu a půl – volající má připravený záložní zdroj ESPN. Proto se
+    zkouší jen dvakrát a s kratším timeoutem.
     """
     last: Optional[Exception] = None
     for attempt in range(attempts):
@@ -68,7 +76,7 @@ def _retry(call, attempts: int = 3, what: str = "data"):
             last = exc
             logger.warning("Načítání %s – pokus %s selhal: %s", what, attempt + 1, exc)
             if attempt < attempts - 1:
-                time.sleep(2.0 + attempt * 3.0)
+                time.sleep(1.0)
     raise last  # type: ignore[misc]
 
 
@@ -490,7 +498,7 @@ def get_schedule(day_offset: int = 0) -> Dict[str, Any]:
         from nba_api.stats.endpoints import scoreboardv3
 
         endpoint = _retry(
-            lambda: scoreboardv3.ScoreboardV3(game_date=date_str, league_id="00", timeout=30),
+            lambda: scoreboardv3.ScoreboardV3(game_date=date_str, league_id="00", timeout=NBA_PRIMARY_TIMEOUT),
             what=f"rozpis {date_str}",
         )
         frames = endpoint.get_data_frames()
@@ -1084,7 +1092,7 @@ def get_leaders(
                         season=season,
                         per_mode_detailed=per_mode,
                         season_type_all_star="Regular Season",
-                        timeout=30,
+                        timeout=NBA_PRIMARY_TIMEOUT,
                     ).get_data_frames()[0],
                     what=f"sezóna {season}",
                 )
@@ -1184,7 +1192,7 @@ def get_standings(season: Optional[str] = None) -> Dict[str, Any]:
                 season=season,
                 season_type="Regular Season",
                 league_id="00",
-                timeout=30,
+                timeout=NBA_PRIMARY_TIMEOUT,
             ).get_data_frames()[0],
             what=f"tabulka {season}",
         )
