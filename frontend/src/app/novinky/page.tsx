@@ -193,7 +193,7 @@ function GamePanel({
       {loading && (
         <div className="flex items-center justify-center gap-2 py-6 text-sm text-slate-400">
           <Loader2 className="w-4 h-4 animate-spin text-orange-500" />
-          Načítám statistiky zápasu z NBA API…
+          Načítám statistiky zápasu…
         </div>
       )}
 
@@ -513,7 +513,7 @@ function SchedulePanel({
       {loading && (
         <div className="flex items-center justify-center gap-2 py-6 text-xs text-slate-400">
           <Loader2 className="w-4 h-4 animate-spin text-orange-500" />
-          Načítám rozpis z NBA API…
+          Načítám rozpis…
         </div>
       )}
 
@@ -817,7 +817,7 @@ export default function NewsPage() {
         <div className="flex flex-col items-center justify-center p-16 space-y-3 bg-slate-900/40 rounded-2xl border border-slate-800">
           <Loader2 className="w-10 h-10 animate-spin text-orange-500" />
           <p className="text-sm font-semibold text-slate-300">
-            Stahuji výsledky z NBA API…
+            Stahuji výsledky…
           </p>
         </div>
       )}
