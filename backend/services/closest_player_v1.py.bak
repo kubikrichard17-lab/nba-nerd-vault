@@ -1,0 +1,612 @@
+"""
+Nejbližší hráč – stabilní a deterministický výběr.
+
+Proč to není jen AI: kdyby o shodě rozhodoval jazykový model, dostal bys
+při každém načtení jiné jméno a občas nesmyslnou dvojici (rozehrávač vs.
+střelec bez míče). Proto:
+
+  1. Shoda se počítá deterministicky z reálných dat podle tří vah:
+       - herní role a shot diet ..... 50 %
+       - fyzický profil ............ 30 %
+       - pokročilé poměry .......... 20 %
+  2. AI (Gemini, temperature 0) dostane hotový seznam kandidátů a smí
+     vybrat POUZE z něj – nemůže si vymyslet hráče ani změnit pořadí
+     nesmyslným směrem. Když AI není k dispozici, výsledek je stejný,
+     jen bez textového zdůvodnění.
+  3. Výsledek se ukládá do tabulky `closest_cache` – druhý dotaz na
+     stejného hráče je okamžitý a vrací přesně totéž.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import threading
+import unicodedata
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+# Verze výpočtu – když se změní váhy nebo logika, stará cache se ignoruje.
+ENGINE_VERSION = 1
+
+WEIGHTS = {"style": 0.50, "physical": 0.30, "stats": 0.20}
+
+# Pevné role, do kterých hráče zařadíme podle Usage Rate, asistencí a střelby.
+ROLES = {
+    "on_ball": "On-ball playmaker (rozehrávač s míčem)",
+    "off_ball": "Off-ball shooter (střelec bez míče)",
+    "two_way_wing": "Two-way wing (křídlo na obou koncích)",
+    "paint_beast": "Paint beast (podkošová síla)",
+    "combo_guard": "Combo guard (kombinovaný rozehrávač)",
+    "stretch_big": "Stretch big (vytahující se pivot)",
+    "point_forward": "Point forward (tvořivé křídlo s míčem)",
+    "scoring_wing": "Scoring wing (křídlo, které skóruje z izolace)",
+    "energy_big": "Energy big (pohyblivý podkošový hráč)",
+    "post_scorer": "Post scorer (podkošový zakončovatel)",
+    "post_hub": "Post hub (podkošový tvůrce hry)",
+}
+
+# Krátké popisy pro UI
+ROLE_SHORT = {
+    "on_ball": "Rozehrávač s míčem",
+    "off_ball": "Střelec bez míče",
+    "two_way_wing": "Two-way křídlo",
+    "paint_beast": "Podkošová síla",
+    "combo_guard": "Combo guard",
+    "stretch_big": "Vytahující se pivot",
+    "point_forward": "Tvořivé křídlo",
+    "scoring_wing": "Skórující křídlo",
+    "energy_big": "Pohyblivý pivot",
+    "post_scorer": "Podkošový zakončovatel",
+    "post_hub": "Podkošový tvůrce hry",
+}
+
+_ROLE_COMPAT = {
+    # stejná role = plná shoda
+    ("on_ball", "on_ball"): 100.0,
+    ("combo_guard", "combo_guard"): 100.0,
+    ("off_ball", "off_ball"): 100.0,
+    ("two_way_wing", "two_way_wing"): 100.0,
+    ("paint_beast", "paint_beast"): 100.0,
+    ("stretch_big", "stretch_big"): 100.0,
+    ("point_forward", "point_forward"): 100.0,
+    ("scoring_wing", "scoring_wing"): 100.0,
+    ("energy_big", "energy_big"): 100.0,
+    ("post_scorer", "post_scorer"): 100.0,
+    # příbuzné role
+    ("on_ball", "combo_guard"): 86.0,
+    ("on_ball", "point_forward"): 88.0,
+    ("combo_guard", "point_forward"): 74.0,
+    ("combo_guard", "off_ball"): 55.0,
+    ("off_ball", "scoring_wing"): 68.0,
+    ("off_ball", "two_way_wing"): 70.0,
+    ("two_way_wing", "scoring_wing"): 82.0,
+    ("two_way_wing", "point_forward"): 72.0,
+    ("paint_beast", "energy_big"): 78.0,
+    ("paint_beast", "post_scorer"): 84.0,
+    ("paint_beast", "stretch_big"): 58.0,
+    ("stretch_big", "energy_big"): 60.0,
+    ("stretch_big", "post_scorer"): 56.0,
+    ("stretch_big", "scoring_wing"): 48.0,
+    ("energy_big", "post_scorer"): 82.0,
+    ("energy_big", "two_way_wing"): 50.0,
+    # vzdálené – nikdy nespojovat
+    ("on_ball", "off_ball"): 22.0,
+    ("on_ball", "two_way_wing"): 45.0,
+    ("on_ball", "scoring_wing"): 62.0,
+    ("on_ball", "paint_beast"): 12.0,
+    ("on_ball", "stretch_big"): 15.0,
+    ("on_ball", "energy_big"): 15.0,
+    ("on_ball", "post_scorer"): 18.0,
+    ("combo_guard", "two_way_wing"): 64.0,
+    ("combo_guard", "scoring_wing"): 60.0,
+    ("combo_guard", "paint_beast"): 15.0,
+    ("combo_guard", "stretch_big"): 18.0,
+    ("combo_guard", "energy_big"): 15.0,
+    ("combo_guard", "post_scorer"): 18.0,
+    ("off_ball", "paint_beast"): 15.0,
+    ("off_ball", "stretch_big"): 32.0,
+    ("off_ball", "energy_big"): 18.0,
+    ("off_ball", "post_scorer"): 18.0,
+    ("off_ball", "point_forward"): 30.0,
+    ("two_way_wing", "paint_beast"): 38.0,
+    ("two_way_wing", "stretch_big"): 52.0,
+    ("two_way_wing", "energy_big"): 50.0,
+    ("two_way_wing", "post_scorer"): 40.0,
+    ("paint_beast", "scoring_wing"): 28.0,
+    ("paint_beast", "point_forward"): 38.0,
+    ("energy_big", "scoring_wing"): 30.0,
+    ("energy_big", "point_forward"): 38.0,
+    ("post_scorer", "scoring_wing"): 38.0,
+    ("post_hub", "post_hub"): 100.0,
+    ("post_hub", "point_forward"): 86.0,
+    ("post_hub", "paint_beast"): 76.0,
+    ("post_hub", "post_scorer"): 72.0,
+    ("post_hub", "energy_big"): 62.0,
+    ("post_hub", "stretch_big"): 62.0,
+    ("post_hub", "on_ball"): 45.0,
+    ("post_hub", "combo_guard"): 40.0,
+    ("post_hub", "two_way_wing"): 45.0,
+    ("post_hub", "scoring_wing"): 40.0,
+    ("post_hub", "off_ball"): 22.0,
+    ("post_scorer", "point_forward"): 32.0,
+    ("scoring_wing", "point_forward"): 78.0,
+}
+
+
+def _role_score(a: str, b: str) -> float:
+    if a == b:
+        return 100.0
+    return _ROLE_COMPAT.get((a, b)) or _ROLE_COMPAT.get((b, a)) or 20.0
+
+
+def _clamp(v: float, lo: float = 0.0, hi: float = 100.0) -> float:
+    return max(lo, min(hi, v))
+
+
+def _num(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None:
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _norm(text: str) -> str:
+    text = unicodedata.normalize("NFKD", (text or "").lower())
+    return "".join(c for c in text if not unicodedata.combining(c)).strip()
+
+
+# --------------------------------------------------------------------------- #
+# 1. Profil hráče – z něj se počítá role i fyzická a statistická shoda
+# --------------------------------------------------------------------------- #
+
+def build_profile(
+    player_id: int,
+    name: str,
+    position: Optional[str],
+    height_cm: Optional[float],
+    weight_kg: Optional[float],
+    stat: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Převede statistiky hráče na jednotný profil se zařazením role."""
+    pts = _num(stat.get("pts"))
+    reb = _num(stat.get("reb"))
+    ast = _num(stat.get("ast"))
+    stl = _num(stat.get("stl"))
+    blk = _num(stat.get("blk"))
+    tov = _num(stat.get("tov"))
+    fga = max(_num(stat.get("fga"), 1.0), 1.0)
+    fg3a = _num(stat.get("fg3a"))
+    fta = _num(stat.get("fta"))
+    fg_pct = _num(stat.get("fg_pct"))
+    ft_pct = _num(stat.get("ft_pct"))
+
+    three_rate = _clamp(fg3a / fga, 0.0, 1.0)          # podíl trojek ze střel
+    ft_rate = _clamp(fta / fga, 0.0, 1.0)              # jak často chodí na čáru
+    ts = _clamp((pts / (2.0 * (fga + 0.44 * fta))) if fga else fg_pct, 0.0, 1.0)
+    ast_to = ast / tov if tov > 0.1 else ast * 2.0
+
+    # Usage Rate – odhad podílu zakončených akcí hráče (běžně 0.12–0.35)
+    minutes = _num(stat.get("min_per_game"), 0.0)
+    if minutes <= 1.0:
+        minutes = 32.0
+    usage = _clamp(
+        ((fga + 0.44 * fta + tov) * 48.0 / minutes) / 100.0, 0.08, 0.45
+    )
+
+    pos = _norm(position or "")
+    height = _num(height_cm, 198.0)
+    weight = _num(weight_kg, 98.0)
+
+    is_guard = any(k in pos for k in ("guard", "g")) and not pos.startswith("f")
+    is_center = "c" in pos and "forward" not in pos and "guard" not in pos
+    is_forward = any(k in pos for k in ("forward", "f"))
+
+    # --- zařazení role (primární hledisko – váha 50 %) ---
+    # Pořadí je záměrné: podkošoví hráči se poznají podle výšky dřív, než
+    # je stihne „chytit" vysoký počet asistencí (Jokić), a tvořivá křídla
+    # (LeBron, Bird) mají vlastní roli místo „stretch big".
+    big = height >= 205 or is_center
+    wing = height >= 198 and not is_guard
+
+    if big:
+        if three_rate >= 0.22 and ast < 5.0:
+            role = "stretch_big"
+        elif ast >= 6.0 and usage >= 0.20 and three_rate < 0.30:
+            role = "post_hub"             # Jokič, Sabonis – podkošový tvůrce
+        elif reb >= 12.0 or blk >= 2.0:
+            role = "paint_beast"
+        elif ast >= 6.0:
+            role = "paint_beast"          # Jokič – podkošový tvůrce hry
+        elif pts >= 17.0:
+            role = "post_scorer"
+        elif usage < 0.16 and pts < 12.0:
+            role = "energy_big"
+        else:
+            role = "post_scorer"
+    elif ast >= 6.0 and usage >= 0.22:
+        role = "point_forward" if wing else "on_ball"
+    elif ast >= 4.5 and is_guard:
+        role = "combo_guard"
+    elif ast >= 5.5:
+        role = "on_ball"
+    elif three_rate >= 0.42 and ast < 4.0:
+        role = "off_ball"
+    elif three_rate >= 0.32 or fg3a >= 4.0:
+        role = "off_ball"
+    elif usage >= 0.24 and pts >= 18.0:
+        role = "scoring_wing"
+    else:
+        role = "two_way_wing"
+
+    return {
+        "id": player_id,
+        "name": name,
+        "position": position or "",
+        "height_cm": height,
+        "weight_kg": weight,
+        "pts": pts,
+        "reb": reb,
+        "ast": ast,
+        "stl": stl,
+        "blk": blk,
+        "tov": tov,
+        "fga": fga,
+        "fg3a": fg3a,
+        "fta": fta,
+        "fg_pct": fg_pct,
+        "ft_pct": ft_pct,
+        "three_rate": round(three_rate, 3),
+        "ft_rate": round(ft_rate, 3),
+        "ts": round(ts, 3),
+        "usage": round(usage, 3),
+        "ast_to": round(ast_to, 2),
+        "role": role,
+        "role_label": ROLES[role],
+        "role_short": ROLE_SHORT[role],
+        "is_guard": is_guard,
+        "is_forward": is_forward,
+        "is_center": is_center,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 2. Tři dílčí skóre
+# --------------------------------------------------------------------------- #
+
+def _style_score(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    """Herní role a shot diet (váha 50 %)."""
+    role = _role_score(a["role"], b["role"])
+
+    # Způsob zakončení – podíl trojek a frekvence trestných hodů
+    shot = 100.0 - abs(a["three_rate"] - b["three_rate"]) * 140.0
+    shot -= abs(a["ft_rate"] - b["ft_rate"]) * 60.0
+    shot = _clamp(shot)
+
+    # Rozdíl mezi podkošovou hrou a střelbou z dálky
+    interior_a = 1.0 - a["three_rate"]
+    interior_b = 1.0 - b["three_rate"]
+    paint = 100.0 - abs(interior_a - interior_b) * 120.0
+    paint = _clamp(paint)
+
+    return round(_clamp(0.62 * role + 0.22 * shot + 0.16 * paint), 1)
+
+
+def _physical_score(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    """Fyzický profil a atletičnost (váha 30 %)."""
+    h_diff = abs(a["height_cm"] - b["height_cm"])
+    w_diff = abs(a["weight_kg"] - b["weight_kg"])
+
+    # 12 cm a 14 kg = ještě velmi podobná postava; dál už se to sráží
+    h = _clamp(100.0 - (h_diff / 12.0) * 100.0)
+    w = _clamp(100.0 - (w_diff / 14.0) * 100.0)
+
+    # Typ postavy: podsaditý vs. vytáhlý (váha na centimetr)
+    build_a = a["weight_kg"] / max(a["height_cm"], 1.0)
+    build_b = b["weight_kg"] / max(b["height_cm"], 1.0)
+    build = _clamp(100.0 - abs(build_a - build_b) * 1400.0)
+
+    return round(_clamp(0.38 * h + 0.37 * w + 0.25 * build), 1)
+
+
+def _stats_score(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    """Pokročilé statistické poměry (váha 20 %)."""
+    # Poměry, ne objemy – hráč s 30 body a role player se 12 body
+    # si mohou být podobní stylem, ale ne dopadem; proto se poměry
+    # porovnávají zvlášť a dopad se počítá z usage/TS.
+    pairs = [
+        ("usage", 0.35, 0.30),
+        ("ast_to", 1.0, 6.0),
+        ("ts", 0.15, 0.15),
+        ("three_rate", 0.40, 0.35),
+        ("ft_rate", 0.25, 0.30),
+    ]
+    total = 0.0
+    weight_sum = 0.0
+    for key, tolerance, weight in pairs:
+        diff = abs(_num(a.get(key)) - _num(b.get(key)))
+        total += _clamp(100.0 - (diff / tolerance) * 100.0) * weight
+        weight_sum += weight
+
+    base = total / weight_sum if weight_sum else 0.0
+
+    # Doskoky a obrana – na 100 držení míče, aby éry nezkreslovaly tempo
+    reb_diff = abs(a["reb"] - b["reb"])
+    def_diff = abs((a["stl"] * 1.2 + a["blk"] * 1.3) - (b["stl"] * 1.2 + b["blk"] * 1.3))
+    extra = _clamp(100.0 - reb_diff * 7.0) * 0.5 + _clamp(100.0 - def_diff * 22.0) * 0.5
+
+    return round(_clamp(0.7 * base + 0.3 * extra), 1)
+
+
+def compare_profile(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
+    """Spočítá celkovou shodu podle vah 50 / 30 / 20."""
+    style = _style_score(a, b)
+    physical = _physical_score(a, b)
+    stats = _stats_score(a, b)
+    total = (
+        WEIGHTS["style"] * style
+        + WEIGHTS["physical"] * physical
+        + WEIGHTS["stats"] * stats
+    )
+    return {
+        "match_pct": round(total, 1),
+        "style_pct": style,
+        "physical_pct": physical,
+        "stats_pct": stats,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# 3. Výběr kandidátů – deterministický, seřazený, bez stejného hráče
+# --------------------------------------------------------------------------- #
+
+def rank_candidates(
+    target: Dict[str, Any],
+    pool: List[Dict[str, Any]],
+    limit: int = 5,
+) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+    """
+    Vrátí nejpodobnější hráče seřazené od nejvyšší shody.
+    Stejný hráč (stejné ID) se nikdy neobjeví.
+    Při rovnosti rozhoduje ID – pořadí je tak vždy stejné.
+    """
+    scored: List[Tuple[Dict[str, Any], Dict[str, Any]]] = []
+    for cand in pool:
+        if cand["id"] == target["id"]:
+            continue
+        result = compare_profile(target, cand)
+        scored.append((cand, result))
+
+    scored.sort(key=lambda item: (-item[1]["match_pct"], item[0]["id"]))
+    return scored[:limit]
+
+
+# --------------------------------------------------------------------------- #
+# 4. AI zdůvodnění – jen nad hotovým seznamem kandidátů
+# --------------------------------------------------------------------------- #
+
+SYSTEM_PROMPT = """Jsi basketbalový analytik. Dostaneš profil hráče a ČÍSLOVANÝ seznam
+kandidátů, kteří už byli vybráni deterministickým algoritmem.
+
+Tvůj úkol NENÍ vybírat nové hráče. Smíš pouze:
+1. Zvolit jedno číslo ze seznamu (nejlepší shodu podle těchto vah:
+   herní role a shot diet 50 %, fyzický profil a atletičnost 30 %,
+   pokročilé statistické poměry 20 %).
+2. Napsat krátké zdůvodnění po kategoriích.
+
+Zakázané kombinace (nikdy je nezvol, i kdyby měly vysoké procento):
+- hráč s Assist % / Usage Rate playmakera (on-ball) a čistý střelec bez míče,
+- podkošový hráč a rozehrávač,
+- hráč s vysokým počtem asistencí a střelec, který netvoří hru.
+
+Vracíš POUZE JSON v tomto tvaru, bez jakéhokoli textu kolem:
+{
+  "reasoning": "1-2 věty: jak hráč hraje, jaká je jeho primární role a shot diet",
+  "pick": 1,
+  "match_percentage": 88,
+  "breakdown": {
+    "herni_styl": "max 1-2 věty o shodě v roli a způsobu zakončení",
+    "fyzicko": "max 1-2 věty o výšce, váze a typu pohybu",
+    "statisticky_dopad": "max 1-2 věty o usage, AST/TO, doskocích a obraně"
+  }
+}"""
+
+
+def _call_gemini_json(prompt: str) -> Optional[Dict[str, Any]]:
+    """Zavolá Gemini s temperature 0 a vrátí naparsovaný JSON (nebo None)."""
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return None
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=api_key)
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                temperature=0,          # deterministické odpovědi
+                top_p=0,                # jen nejpravděpodobnější tokeny
+                top_k=1,
+                seed=7,                 # stejný seed = stejná odpověď
+                response_mime_type="application/json",
+                system_instruction=SYSTEM_PROMPT,
+            ),
+        )
+        text = (response.text or "").strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            text = text[text.find("{") :]
+        return json.loads(text)
+    except Exception as exc:  # pragma: no cover
+        logger.warning("AI zdůvodnění se nepodařilo získat: %s", exc)
+        return None
+
+
+def _ai_prompt(target: Dict[str, Any], ranked: List[Tuple[Dict[str, Any], Dict[str, Any]]]) -> str:
+    lines = [
+        f"HRÁČ: {target['name']} ({target['position'] or 'pozice neuvedena'}, "
+        f"{target['height_cm']:.0f} cm, {target['weight_kg']:.0f} kg)",
+        f"- role: {target['role_label']}",
+        f"- Usage: {target['usage']:.2f}, AST/TO: {target['ast_to']:.2f}, "
+        f"TS: {target['ts']:.3f}, podíl trojek: {target['three_rate']:.2f}",
+        f"- {target['pts']:.1f} b, {target['reb']:.1f} d, {target['ast']:.1f} a na zápas",
+        "",
+        "KANDIDÁTI (vyber jedno číslo):",
+    ]
+    for idx, (cand, res) in enumerate(ranked, start=1):
+        lines.append(
+            f"{idx}. {cand['name']} ({cand['position'] or '-'}, "
+            f"{cand['height_cm']:.0f} cm, {cand['weight_kg']:.0f} kg) – "
+            f"{cand['role_label']}; shoda {res['match_pct']:.1f} % "
+            f"(styl {res['style_pct']:.0f}, fyzično {res['physical_pct']:.0f}, "
+            f"statistiky {res['stats_pct']:.0f}); "
+            f"Usage {cand['usage']:.2f}, AST/TO {cand['ast_to']:.2f}, "
+            f"podíl trojek {cand['three_rate']:.2f}"
+        )
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- #
+# 5. Textové zdůvodnění bez AI (aby výsledek byl čitelný vždy)
+# --------------------------------------------------------------------------- #
+
+def _fallback_breakdown(
+    target: Dict[str, Any],
+    cand: Dict[str, Any],
+    res: Dict[str, Any],
+) -> Dict[str, str]:
+    def same_role() -> str:
+        if target["role"] == cand["role"]:
+            return f"Oba hrají roli {ROLES[target['role']].lower()}"
+        return (
+            f"Role {ROLES[target['role']].lower()} proti "
+            f"{ROLES[cand['role']].lower()}"
+        )
+
+    style = (
+        f"{same_role()}; podíl trojek {target['three_rate']:.2f} vs "
+        f"{cand['three_rate']:.2f} a frekvence trestných hodů "
+        f"{target['ft_rate']:.2f} vs {cand['ft_rate']:.2f}."
+    )
+    physical = (
+        f"Výška {target['height_cm']:.0f} vs {cand['height_cm']:.0f} cm, "
+        f"váha {target['weight_kg']:.0f} vs {cand['weight_kg']:.0f} kg – "
+        f"shoda fyzického profilu {res['physical_pct']:.0f} %."
+    )
+    stats = (
+        f"Usage {target['usage']:.2f} vs {cand['usage']:.2f}, AST/TO "
+        f"{target['ast_to']:.2f} vs {cand['ast_to']:.2f}, doskoky "
+        f"{target['reb']:.1f} vs {cand['reb']:.1f} – statistická shoda "
+        f"{res['stats_pct']:.0f} %."
+    )
+    return {"herni_styl": style, "fyzicko": physical, "statisticky_dopad": stats}
+
+
+def _fallback_reasoning(target: Dict[str, Any]) -> str:
+    return (
+        f"{target['name']} je {ROLES[target['role']].lower()} s Usage "
+        f"{target['usage']:.2f}, podílem trojek {target['three_rate']:.2f} "
+        f"a AST/TO {target['ast_to']:.2f}. Shoda se proto hledá především "
+        f"ve stejné roli a stejném způsobu zakončení."
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 6. Veřejné API
+# --------------------------------------------------------------------------- #
+
+_LOCAL_CACHE: Dict[str, Dict[str, Any]] = {}
+_LOCAL_LOCK = threading.Lock()
+
+
+def local_cache_get(key: str) -> Optional[Dict[str, Any]]:
+    with _LOCAL_LOCK:
+        return _LOCAL_CACHE.get(key)
+
+
+def local_cache_put(key: str, value: Dict[str, Any]) -> None:
+    with _LOCAL_LOCK:
+        _LOCAL_CACHE[key] = value
+
+
+def resolve(
+    target: Dict[str, Any],
+    pool: List[Dict[str, Any]],
+    use_ai: bool = True,
+    limit: int = 5,
+) -> Optional[Dict[str, Any]]:
+    """
+    Vybere nejbližšího hráče a připraví celou odpověď pro frontend.
+    Pokud AI vybere jiného kandidáta než první v pořadí, musí to být
+    z top 3 – nižší kandidát by popřel výpočet.
+    """
+    ranked = rank_candidates(target, pool, limit=limit)
+    if not ranked:
+        return None
+
+    best, best_res = ranked[0]
+    ai: Optional[Dict[str, Any]] = None
+    if use_ai:
+        ai = _call_gemini_json(_ai_prompt(target, ranked))
+
+    chosen, chosen_res = best, best_res
+    if ai:
+        try:
+            pick = int(ai.get("pick") or 1)
+        except (TypeError, ValueError):
+            pick = 1
+        if 1 <= pick <= min(3, len(ranked)):
+            chosen, chosen_res = ranked[pick - 1]
+
+    breakdown = _fallback_breakdown(target, chosen, chosen_res)
+    reasoning = _fallback_reasoning(target)
+    if ai:
+        ai_breakdown = ai.get("breakdown") or {}
+        for key in ("herni_styl", "fyzicko", "statisticky_dopad"):
+            value = (ai_breakdown.get(key) or "").strip()
+            if value:
+                breakdown[key] = value
+        if (ai.get("reasoning") or "").strip():
+            reasoning = ai["reasoning"].strip()
+
+    return {
+        "engine_version": ENGINE_VERSION,
+        "player_id": target["id"],
+        "player_name": target["name"],
+        "player_role": target["role_label"],
+        "closest": {
+            "id": chosen["id"],
+            "full_name": chosen["name"],
+            "position": chosen["position"],
+            "role_label": chosen["role_label"],
+            "match_pct": chosen_res["match_pct"],
+            "style_pct": chosen_res["style_pct"],
+            "physical_pct": chosen_res["physical_pct"],
+            "stats_pct": chosen_res["stats_pct"],
+            # stará pole – frontend je používá pro štítky
+            "stylistic_pct": chosen_res["style_pct"],
+            "statistical_pct": chosen_res["stats_pct"],
+        },
+        "reasoning": reasoning,
+        "match_percentage": round(chosen_res["match_pct"]),
+        "breakdown": breakdown,
+        "alternatives": [
+            {
+                "id": cand["id"],
+                "full_name": cand["name"],
+                "match_pct": res["match_pct"],
+                "role_label": cand["role_label"],
+            }
+            for cand, res in ranked[1:4]
+        ],
+        "weights": WEIGHTS,
+        "ai_used": bool(ai),
+        "generated_at": datetime.utcnow().isoformat(),
+    }
