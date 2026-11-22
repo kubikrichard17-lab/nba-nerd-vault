@@ -870,6 +870,17 @@ def get_game_boxscore(game_id: str) -> Dict[str, Any]:
     if cached is not None:
         return cached
 
+    # Rozpis zápasů (ESPN) posílá číselné ESPN ID, např. 401910023 – to NBA API
+    # nezná, takže se boxscore bere rovnou z ESPN. Probíhající zápas se drží
+    # v paměti jen krátce, aby se statistiky průběžně obnovovaly.
+    if game_id.isdigit() and game_id.startswith("4"):
+        espn = _espn()
+        summary = espn.game_summary(game_id) if espn else None
+        if summary:
+            # probíhající zápas se neukládá (stránka si ho obnovuje sama)
+            return summary if summary.get("live") else _cache_set(key, summary)
+        raise NewsDataError("Pro tento zápas ještě nejsou statistiky k dispozici.")
+
     frames = None
     last_error: Optional[Exception] = None
     try:
