@@ -316,6 +316,59 @@ def _team_name(abbr: str) -> str:
 # 1) Výsledky zápasů
 # --------------------------------------------------------------------------- #
 
+def _espn_game_log(season: str, days: int = 21) -> List[Dict[str, Any]]:
+    """
+    Výsledky zápasů ze záložního zdroje (ESPN) za posledních pár týdnů.
+
+    ESPN neumí vrátit celou sezónu jedním dotazem, ale skóreboard po dnech
+    ano. Pro stránku Novinky (poslední výsledky) to stačí.
+
+    Vrací stejný tvar, jaký skládá LeagueGameLog.
+    """
+    espn = _espn()
+    if not espn:
+        return []
+
+    from datetime import timedelta
+
+    rows: List[Dict[str, Any]] = []
+    today = datetime.now(timezone.utc).date()
+    for offset in range(days):
+        day = (today - timedelta(days=offset)).isoformat()
+        board = espn.scoreboard(day, -offset, TEAM_CZ)
+        if not board:
+            continue
+        for game in board.get("games") or []:
+            if game.get("status") != 3:  # jen dohrané zápasy
+                continue
+            home = game.get("home") or {}
+            away = game.get("away") or {}
+            combined = f"{away.get('abbr', '')}{home.get('abbr', '')}"
+            for side, other, matchup in (
+                (home, away, f"{home.get('abbr', '')} vs. {away.get('abbr', '')}"),
+                (away, home, f"{away.get('abbr', '')} @ {home.get('abbr', '')}"),
+            ):
+                mine = _to_int(side.get("score"))
+                theirs = _to_int(other.get("score"))
+                rows.append(
+                    {
+                        "game_id": combined + str(game.get("game_id") or ""),
+                        "game_date": day,
+                        "season_id": season,
+                        "team": str(side.get("abbr") or ""),
+                        "team_name": _team_name(side.get("abbr") or ""),
+                        "matchup": matchup,
+                        "wl": "W" if mine > theirs else "L",
+                        "pts": mine,
+                        "plus_minus": mine - theirs,
+                        "opp_pts": theirs,
+                    }
+                )
+    rows.sort(key=lambda r: (r["game_date"], r["game_id"]), reverse=True)
+    logger.info("Výsledky zápasů načteny ze záložního zdroje ESPN (%s řádků)", len(rows))
+    return rows
+
+
 def _fetch_team_game_log(season: str) -> List[Dict[str, Any]]:
     key = f"team_gamelog:{season}"
     cached = _cache_get(key, GAMES_TTL)
@@ -333,11 +386,10 @@ def _fetch_team_game_log(season: str) -> List[Dict[str, Any]]:
         )
         df = endpoint.get_data_frames()[0]
     except Exception as exc:  # pragma: no cover – síťová chyba
-        logger.error("Nelze načíst LeagueGameLog pro sezónu %s: %s", season, exc)
-        # Prázdný seznam = tabulka se sestaví, jen bez formy posledních zápasů.
-        # Dřív tu výjimka letěla dál a shodila i /api/standings, i když
-        # samotná tabulka se načíst povedla.
-        return _cache_set(key, [])
+        logger.warning("LeagueGameLog pro sezónu %s nešel (%s), zkouším ESPN", season, exc)
+        espn = _espn()
+        rows = _espn_game_log(season) if espn else []
+        return _cache_set(key, rows)
 
     if df is None or df.empty:
         return _cache_set(key, [])
@@ -1118,7 +1170,9 @@ def get_leaders(
                         "title": f"Lídři sezóny {season} – {def_info['label']}",
                         "note": note,
                         "rows": espn_rows,
-                        "source": {"season": "ESPN (záložní zdroj)"},
+                        # `source` musí být text – frontend ho vypisuje přímo
+                        # (dřív tu byl slovník a React na něm spadl).
+                        "source": "ESPN (záložní zdroj – NBA API z tohoto serveru neodpovídá)",
                     }
                     return _cache_set(key, payload)
                 raise NewsDataError(
