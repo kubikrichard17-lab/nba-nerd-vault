@@ -8,6 +8,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from services import source_switch
+
+source_switch.install()
+
 from database import engine, get_db, Base
 from models import Player, PlayerSeasonStat, PlayerAward, ComparisonCache, ClosestCache
 from services.nba_fetcher import (
