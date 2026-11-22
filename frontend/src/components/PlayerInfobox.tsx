@@ -44,7 +44,7 @@ export const PlayerInfobox: React.FC<PlayerInfoboxProps> = ({ player }) => {
                 : 'bg-slate-800 text-slate-400 border border-slate-700'
             }`}
           >
-            {player.is_active ? 'Aktivní v NBA' : 'Historická legenda'}
+            {player.is_active ? 'Aktivní v NBA' : 'Bývalý hráč NBA'}
           </span>
         </div>
       </div>
