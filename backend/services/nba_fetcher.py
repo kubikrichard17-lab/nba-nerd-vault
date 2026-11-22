@@ -11,6 +11,13 @@ from services.ai_scout import generate_scouting_report
 
 logger = logging.getLogger(__name__)
 
+# NBA API z datových center (Render) neodpovídá – čekání musí být krátké,
+# aby se profil načetl ze záložního zdroje dřív, než prohlížeč vzdá.
+NBA_INFO_TIMEOUT = 8
+NBA_INFO_ATTEMPTS = 2
+NBA_CAREER_TIMEOUT = 8
+NBA_CAREER_ATTEMPTS = 1
+
 AWARD_TRANSLATIONS = {
     "nba champion": "Šampion NBA",
     "nba most valuable player": "Nejužitečnější hráč ligy (MVP)",
@@ -293,7 +300,7 @@ def search_players_service(query: str, db: Session, limit: int = 15) -> List[Dic
     return results
 
 
-def _career_frame(player_id: int, attempts: int = 3):
+def _career_frame(player_id: int, attempts: int = NBA_CAREER_ATTEMPTS):
     """
     Sezónní tabulka kariéry z NBA API.
 
@@ -310,14 +317,14 @@ def _career_frame(player_id: int, attempts: int = 3):
     for attempt in range(attempts):
         try:
             endpoint = playercareerstats.PlayerCareerStats(
-                player_id=player_id, per_mode36="PerGame", timeout=12
+                player_id=player_id, per_mode36="PerGame", timeout=NBA_CAREER_TIMEOUT
             )
             frame = endpoint.season_totals_regular_season.get_data_frame()
             if frame is not None and not frame.empty:
                 return frame
         except Exception as exc:  # pragma: no cover
             last_error = exc
-            time.sleep(1.2 * (attempt + 1))
+            time.sleep(1.0 * (attempt + 1))
 
     if last_error:
         logger.warning("Kariérní tabulka %s z NBA API nešla: %s", player_id, last_error)
@@ -530,17 +537,22 @@ def fetch_and_cache_player(player_id: int, db: Session) -> Optional[Player]:
         # 1. Player Info
         # NBA API občas odpoví chybovou odpovědí bez dat – zkusí se to víckrát,
         # než se hráč prohlásí za neexistujícího.
+        # Na serveru (Render) NBA API z datových center vůbec neodpovídá a každý
+        # pokus visí do timeoutu – proto jsou dva pokusy po 8 s, ne tři po 12 s.
+        # Dřív se profil nového hráče načítal 72 s, teď se do 20 s sáhne po ESPN.
         info_df = None
         last_error: Optional[Exception] = None
-        for attempt in range(3):
+        for attempt in range(NBA_INFO_ATTEMPTS):
             try:
-                info_endpoint = commonplayerinfo.CommonPlayerInfo(player_id=player_id, timeout=12)
+                info_endpoint = commonplayerinfo.CommonPlayerInfo(
+                    player_id=player_id, timeout=NBA_INFO_TIMEOUT
+                )
                 info_df = info_endpoint.common_player_info.get_data_frame()
                 if info_df is not None and not info_df.empty:
                     break
             except Exception as exc:  # pragma: no cover
                 last_error = exc
-                time.sleep(1.5 * (attempt + 1))
+                time.sleep(1.0 * (attempt + 1))
 
         if info_df is None or info_df.empty:
             logger.error(
