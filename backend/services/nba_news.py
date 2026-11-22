@@ -766,6 +766,96 @@ def _aggregate_team_stats(players: List[Dict[str, Any]]) -> List[Dict[str, Any]]
     return out
 
 
+def _espn_boxscore(game_id: str) -> Optional[Dict[str, Any]]:
+    """
+    Boxscore zápasu ze záložního zdroje (ESPN).
+
+    NBA API z datového centra neodpovídá, takže bez tohohle se po kliknutí
+    na zápas v Novinkách ukázalo jen „nepodařilo se načíst".
+
+    ESPN má jiná ID zápasů, takže se projde skóreboard za posledních pár dní
+    a porovnají se dvojice týmů – ty jsou v našem ID obsažené (PORNY… = POR vs NY).
+    """
+    espn = _espn()
+    if not espn:
+        return None
+
+    our_teams = _teams_from_game_id(game_id)
+    if not our_teams:
+        return None
+
+    from datetime import timedelta
+
+    today = datetime.now(timezone.utc).date()
+    for offset in range(0, 10):
+        day = (today - timedelta(days=offset)).isoformat()
+        board = espn.scoreboard(day, -offset, TEAM_CZ)
+        if not board:
+            continue
+        for game in board.get("games") or []:
+            if game.get("status") != 3:  # statistiky mají jen dohrané zápasy
+                continue
+            home = str((game.get("home") or {}).get("abbr") or "")
+            away = str((game.get("away") or {}).get("abbr") or "")
+            if {home, away} != our_teams:
+                continue
+            summary = espn.game_summary(str(game.get("game_id") or ""))
+            if summary:
+                return summary
+    return None
+
+
+# zkratky klubů, které se v ID zápasu vyskytují (nejdelší první)
+_TEAM_ABBRS = [
+    "BKN", "NOP", "NYK", "POR", "PHX", "PHI", "SAS", "UTA", "WAS", "MIA", "MIL",
+    "MIN", "OKC", "ORL", "SAC", "TOR", "CHA", "CHI", "CLE", "DAL", "DEN", "DET",
+    "GSW", "HOU", "IND", "LAC", "LAL", "MEM", "ATL", "BOS", "NY", "NO", "SA",
+    "GS", "UT", "WSH", "PHO", "BRK",
+]
+
+
+def _teams_from_game_id(game_id: str) -> Optional[set]:
+    """
+    Dvojice týmů z našeho ID zápasu.
+
+    Naše ID (LeagueGameLog) vypadá tak, že začíná zkratkami obou týmů:
+    'PORNY401910024' = POR + NY. ESPN má ID vlastní, takže tohle je jediný
+    způsob, jak zápas dohledat.
+    """
+    head = str(game_id or "")[:7].upper()
+    for first in _TEAM_ABBRS:
+        if not head.startswith(first):
+            continue
+        rest = head[len(first):]
+        for second in _TEAM_ABBRS:
+            if rest.startswith(second):
+                return {_normalize_abbr(first), _normalize_abbr(second)}
+    return None
+
+
+def _normalize_abbr(abbr: str) -> str:
+    """Sjednotí zkratky na tvar, který používá ESPN."""
+    mapping = {
+        "NY": "NY",
+        "NYK": "NY",
+        "NO": "NO",
+        "NOP": "NO",
+        "SA": "SA",
+        "SAS": "SA",
+        "GS": "GS",
+        "GSW": "GS",
+        "UT": "UTAH",
+        "UTA": "UTAH",
+        "WSH": "WSH",
+        "WAS": "WSH",
+        "PHO": "PHX",
+        "PHX": "PHX",
+        "BRK": "BKN",
+        "BKN": "BKN",
+    }
+    return mapping.get(abbr.upper(), abbr.upper())
+
+
 def get_game_boxscore(game_id: str) -> Dict[str, Any]:
     """Boxscore zápasu – statistiky všech hráčů rozdělené po týmech."""
     game_id = str(game_id or "").strip()
@@ -777,22 +867,30 @@ def get_game_boxscore(game_id: str) -> Dict[str, Any]:
     if cached is not None:
         return cached
 
-    from nba_api.stats.endpoints import boxscoretraditionalv3
-
     frames = None
     last_error: Optional[Exception] = None
-    for attempt in range(3):
-        try:
-            endpoint = boxscoretraditionalv3.BoxScoreTraditionalV3(game_id=game_id, timeout=30)
-            frames = endpoint.get_data_frames()
-            break
-        except Exception as exc:  # pragma: no cover – NBA API občas zahodí spojení
-            last_error = exc
-            logger.warning("Boxscore %s – pokus %s selhal: %s", game_id, attempt + 1, exc)
-            time.sleep(2 + attempt * 3)
+    try:
+        from nba_api.stats.endpoints import boxscoretraditionalv3
+
+        for attempt in range(2):
+            try:
+                endpoint = boxscoretraditionalv3.BoxScoreTraditionalV3(
+                    game_id=game_id, timeout=NBA_PRIMARY_TIMEOUT
+                )
+                frames = endpoint.get_data_frames()
+                break
+            except Exception as exc:  # pragma: no cover – NBA API občas zahodí spojení
+                last_error = exc
+                logger.warning("Boxscore %s – pokus %s selhal: %s", game_id, attempt + 1, exc)
+                time.sleep(1.0)
+    except Exception as exc:  # pragma: no cover
+        last_error = exc
 
     if frames is None:
-        logger.error("Boxscore zápasu %s selhalo: %s", game_id, last_error)
+        logger.warning("Boxscore %s z NBA API nešlo (%s), zkouším ESPN", game_id, last_error)
+        fallback = _espn_boxscore(game_id)
+        if fallback:
+            return _cache_set(key, fallback)
         raise NewsDataError("Boxscore tohoto zápasu se nepodařilo načíst z NBA API.")
 
     if not frames or frames[0] is None or frames[0].empty:
