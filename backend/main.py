@@ -12,7 +12,8 @@ from database import engine, get_db, Base
 from models import Player, PlayerSeasonStat, PlayerAward, ComparisonCache, ClosestCache
 from services.nba_fetcher import (
     search_players_service,
-    fetch_and_cache_player
+    fetch_and_cache_player,
+    ensure_correct_name,
 )
 from services.similarity_engine import compare_players
 from services import closest_service
@@ -381,6 +382,10 @@ def get_seeded_players(db: Session = Depends(get_db)):
 def get_player_profile(player_id: int, db: Session = Depends(get_db)):
     """Return full player profile with career stats, awards, Wikipedia bio and AI scout report."""
     player = fetch_and_cache_player(player_id=player_id, db=db)
+    if player is not None:
+        # ID z NBA musí mít správné jméno – data ze záložního zdroje mohla
+        # pod stejné číslo uložit cizí hráče (ESPN má vlastní číselník).
+        player = ensure_correct_name(player, db)
     if not player:
         raise HTTPException(status_code=404, detail="Hráč nebyl nalezen v databázi ani v NBA API.")
 
@@ -705,6 +710,10 @@ def get_closest_player(
     player = db.query(Player).filter(Player.id == player_id).first()
     if not player:
         player = fetch_and_cache_player(player_id=player_id, db=db)
+    if player is not None:
+        # ID z NBA musí mít správné jméno – data ze záložního zdroje mohla
+        # pod stejné číslo uložit cizí hráče (ESPN má vlastní číselník).
+        player = ensure_correct_name(player, db)
     if not player:
         raise HTTPException(status_code=404, detail="Hráč nebyl nalezen v databázi ani v NBA API.")
 
