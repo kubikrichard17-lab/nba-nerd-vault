@@ -338,7 +338,13 @@ def last_game(player_id: int) -> Optional[Dict[str, Any]]:
         if not events:
             return None
 
-        played = events[-1]
+        # ESPN řadí zápasy po měsících a typech sezóny (příprava je na konci),
+        # takže poslední v seznamu není nejnovější – bere se nejvyšší datum.
+        meta_all = data.get("events") or {}
+        played = max(
+            events,
+            key=lambda ev: str((meta_all.get(str(ev.get("eventId"))) or {}).get("gameDate") or ""),
+        )
         event_id = str(played.get("eventId") or "")
         stats = played.get("stats") or []
         values = {}
