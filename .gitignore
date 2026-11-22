@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+
+# Virtuální prostředí
+venv/
+.venv/
+env/
+ENV/
+
+# Node / Next.js
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/.vercel/
+.turbo/
+*.tsbuildinfo
+next-env.d.ts
+
+# Proměnné prostředí (tajné klíče)
+.env
+.env.local
+.env.*.local
+frontend/.env.local
+backend/.env
+
+# Logy
+*.log
+npm-debug.log*
+yarn-error.log*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Dočasné soubory a pomocné skripty
+*.tmp
+backend/_t_*.py
+backend/_dbg_*.py
+backend/_unify_*.py
+backend/_fix_*.py
+backend/_season_*.py
+
+# Pozor: datové soubory se NEPOUŽÍVAJÍ ignorovat – backend/nba_vault.db
+# i všechny *.json.gz musí být v repozitáři, aby server měl data hned
+# od prvního spuštění.
+!backend/nba_vault.db
+!backend/**/*.json.gz
+!backend/*.json.gz
