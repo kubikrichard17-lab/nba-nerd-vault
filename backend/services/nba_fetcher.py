@@ -256,6 +256,54 @@ def get_static_players_list() -> List[Dict[str, Any]]:
         ]
 
 
+def canonical_name(player_id: int) -> Optional[str]:
+    """Jméno hráče podle NBA registru (None, když ho registr nezná)."""
+    try:
+        from nba_api.stats.static import players
+
+        for p in players.get_players():
+            if int(p["id"]) == int(player_id):
+                return str(p["full_name"])
+    except Exception:  # pragma: no cover
+        pass
+    return None
+
+
+def ensure_correct_name(player: Player, db: Session) -> Player:
+    """
+    Ověří, že v databázi je u ID správné jméno.
+
+    ESPN má vlastní číselník hráčů, takže když se profil dotahoval ze
+    záložního zdroje, mohlo se pod ID z NBA uložit cizí jméno (např. ID 893
+    = Michael Jordan se uložil jako Jameel Watkins). Tohle to porovná
+    s registrem NBA a případně opraví i sezóny.
+    """
+    expected = canonical_name(player.id)
+    if not expected:
+        return player
+    if (player.full_name or "").strip().lower() == expected.lower():
+        return player
+
+    logger.warning(
+        "U hráče %s bylo v databázi jméno %r, správně je %r – opravuji",
+        player.id,
+        player.full_name,
+        expected,
+    )
+    first, _, last = expected.partition(" ")
+    player.full_name = expected
+    player.first_name = first
+    player.last_name = last
+    db.query(PlayerSeasonStat).filter(PlayerSeasonStat.player_id == player.id).delete()
+    try:
+        db.commit()
+        db.refresh(player)
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Oprava jména hráče %s selhala: %s", player.id, exc)
+        db.rollback()
+    return player
+
+
 def search_players_service(query: str, db: Session, limit: int = 15) -> List[Dict[str, Any]]:
     """Search players in SQLite cache first, then in nba_api static registry."""
     clean_query = query.strip().lower()
@@ -281,6 +329,9 @@ def search_players_service(query: str, db: Session, limit: int = 15) -> List[Dic
         seen_ids.add(p.id)
 
     # 2. Search static registry
+    # Registr NBA se prochází vždy celý – dřív se hledání ukončilo, jakmile
+    # bylo výsledků dost, takže na Michaela Jordana (ID 893) se nedostalo
+    # a našli se jen novější hráči se jménem Jordan.
     static_players = get_static_players_list()
     for sp in static_players:
         if clean_query in sp["full_name"].lower():
@@ -294,8 +345,9 @@ def search_players_service(query: str, db: Session, limit: int = 15) -> List[Dic
                     "headshot_url": f"https://cdn.nba.com/headshots/nba/latest/1040x760/{sp['id']}.png"
                 })
                 seen_ids.add(sp["id"])
-        if len(results) >= limit:
-            break
+
+    # přesná shoda jména nahoru – kdo hledá „jordan", chce Michaela Jordana
+    results.sort(key=lambda r: (r["full_name"].lower() != clean_query, not r.get("in_db"), r["full_name"]))
 
     return results
 
