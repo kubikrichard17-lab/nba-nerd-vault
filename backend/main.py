@@ -877,7 +877,15 @@ def get_last_game(player_id: int):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Chyba při načítání posledního zápasu hráče {player_id}: {e}", exc_info=True)
+        logger.warning(f"Poslední zápas hráče {player_id} z NBA API nešel: {e} – zkouším ESPN")
+        try:
+            from services import espn_seasons
+
+            fallback = espn_seasons.last_game(player_id)
+            if fallback:
+                return _json_safe(fallback)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("ESPN poslední zápas %s selhal: %s", player_id, exc)
         raise HTTPException(status_code=503, detail="Nelze načíst data posledního zápasu z NBA API.")
 
 
