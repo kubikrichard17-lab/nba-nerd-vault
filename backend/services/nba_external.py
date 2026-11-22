@@ -1030,6 +1030,18 @@ def career_profile(player_id: Optional[int], name: str) -> Optional[Dict[str, An
         # Málo zápasů = NBA API nezná celou kariéru, vezme se Basketball-Reference
         if stats and stats.get("gp", 0) < 250:
             stats = None
+
+    # Na serveru NBA API neodpovídá – ESPN je pak nejrychlejší a nejspolehlivější
+    if not stats and player_id:
+        try:
+            from . import espn_seasons
+
+            espn = espn_seasons.career_stats(player_id)
+            if espn and espn.get("gp", 0) >= 50:
+                stats = dict(espn)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("ESPN kariéra %s selhala: %s", player_id, exc)
+
     if not stats:
         stats = bbref_career(name)
     if not stats:
