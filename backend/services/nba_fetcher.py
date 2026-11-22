@@ -294,6 +294,10 @@ def ensure_correct_name(player: Player, db: Session) -> Player:
     player.full_name = expected
     player.first_name = first
     player.last_name = last
+    from datetime import datetime
+
+    player.updated_at = datetime.utcnow()
+    # sezóny pod tímhle ID patřily jinému hráči – musí se načíst znovu
     db.query(PlayerSeasonStat).filter(PlayerSeasonStat.player_id == player.id).delete()
     try:
         db.commit()
@@ -301,7 +305,15 @@ def ensure_correct_name(player: Player, db: Session) -> Player:
     except Exception as exc:  # pragma: no cover
         logger.warning("Oprava jména hráče %s selhala: %s", player.id, exc)
         db.rollback()
-    return player
+        return player
+
+    # Data hráče chybí (sahalo se na cizí), takže se dotáhnou znovu.
+    # `existing.stats` je teď prázdné, takže se opravdu stahuje.
+    try:
+        return fetch_and_cache_player(player.id, db) or player
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Dotazení dat po opravě jména %s selhalo: %s", player.id, exc)
+        return player
 
 
 def search_players_service(query: str, db: Session, limit: int = 15) -> List[Dict[str, Any]]:
