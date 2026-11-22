@@ -185,9 +185,9 @@ export const ComparePlayerSearch: React.FC<ComparePlayerSearchProps> = ({
                         <div className="text-xs font-bold text-white truncate">
                           {player.full_name}
                         </div>
-                        <div className="text-[10px] text-slate-400">
-                          {player.is_active ? 'Aktivní v NBA' : 'Bývalý hráč NBA'}
-                        </div>
+                        {player.is_active && (
+                          <div className="text-[10px] text-slate-400">Aktivní v NBA</div>
+                        )}
                       </div>
                     </div>
 
