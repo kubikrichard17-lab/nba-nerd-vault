@@ -325,16 +325,59 @@ def _career_frame(player_id: int, attempts: int = 3):
 
 
 def _career_frame_bbref(player_id: int):
-    """Záložní zdroj sezón: Basketball-Reference (stejné sloupce jako NBA)."""
+    """
+    Záložní zdroj sezón: Basketball-Reference.
+
+    Bere se dřív než ESPN, protože má data i pro staré éry (Walton, Unseld).
+    Když Basketball-Reference nic nemá, zkusí se ještě ESPN – to je jediný
+    zdroj, který na serveru (Render) opravdu odpovídá, protože NBA API
+    z datových center blokuje.
+    """
     try:
         import pandas as pd
 
         from . import nba_external
 
         rows = nba_external.bbref_season_rows(player_id)
-        if not rows:
-            return pd.DataFrame()
-        return pd.DataFrame(rows)
+        if rows:
+            return pd.DataFrame(rows)
+
+        # ESPN: sezónní průměry – stejné názvy sloupců jako NBA API
+        from . import espn_seasons
+
+        espn_rows = espn_seasons.player_season_stats(player_id)
+        if espn_rows:
+            mapped = []
+            for row in espn_rows:
+                mapped.append(
+                    {
+                        "SEASON_ID": row.get("season_id"),
+                        "GP": row.get("gp"),
+                        "GS": row.get("gs"),
+                        "MIN": row.get("min_per_game"),
+                        "PTS": row.get("pts"),
+                        "REB": row.get("reb"),
+                        "AST": row.get("ast"),
+                        "STL": row.get("stl"),
+                        "BLK": row.get("blk"),
+                        "TOV": row.get("tov"),
+                        "PF": row.get("pf"),
+                        "FGM": row.get("fgm"),
+                        "FGA": row.get("fga"),
+                        "FG_PCT": row.get("fg_pct"),
+                        "FG3M": row.get("fg3m"),
+                        "FG3A": row.get("fg3a"),
+                        "FG3_PCT": row.get("fg3_pct"),
+                        "FTM": row.get("ftm"),
+                        "FTA": row.get("fta"),
+                        "FT_PCT": row.get("ft_pct"),
+                        "TEAM_ABBREVIATION": "",
+                        "PLAYER_AGE": None,
+                    }
+                )
+            logger.info("Kariéra hráče %s načtena ze záložního zdroje ESPN", player_id)
+            return pd.DataFrame(mapped)
+        return pd.DataFrame()
     except Exception as exc:  # pragma: no cover
         logger.warning("Záložní sezóny pro %s selhaly: %s", player_id, exc)
         return pd.DataFrame()
@@ -372,6 +415,90 @@ def _seasons_from(season_id: str) -> int:
     today = date.today()
     current = today.year if today.month >= 7 else today.year - 1
     return max(current - start, 0)
+
+
+def _player_from_espn(player_id: int, db: Session) -> Optional[Player]:
+    """
+    Sestaví profil hráče ze záložního zdroje (ESPN).
+
+    Používá se ve chvíli, kdy NBA API neodpovídá (Render) – bez toho by
+    aplikace hlásila, že hráč neexistuje, i když existuje.
+    """
+    try:
+        from . import espn_seasons
+
+        career = espn_seasons.career_stats(player_id)
+        seasons = espn_seasons.player_season_stats(player_id)
+    except Exception as exc:  # pragma: no cover
+        logger.warning("ESPN profil %s selhal: %s", player_id, exc)
+        return None
+
+    if not career and not seasons:
+        return None
+
+    career = career or {}
+    name = str(career.get("name") or f"Hráč {player_id}")
+    first_name, _, last_name = name.partition(" ")
+
+    player = db.query(Player).filter(Player.id == player_id).first()
+    if not player:
+        player = Player(id=player_id, full_name=name)
+        db.add(player)
+
+    player.full_name = name
+    player.first_name = first_name
+    player.last_name = last_name
+    player.position = str(career.get("position") or "") or player.position
+    player.height_cm = career.get("height_cm") or player.height_cm
+    player.weight_kg = career.get("weight_kg") or player.weight_kg
+    player.headshot_url = (
+        player.headshot_url
+        or f"https://cdn.nba.com/headshots/nba/latest/1040x760/{player_id}.png"
+    )
+    player.is_active = bool(player.is_active)
+
+    # sezóny: stare se smažou jen když přišly nové
+    if seasons:
+        db.query(PlayerSeasonStat).filter(PlayerSeasonStat.player_id == player_id).delete()
+        for row in seasons:
+            db.add(
+                PlayerSeasonStat(
+                    player_id=player_id,
+                    season_id=row.get("season_id"),
+                    team_abbreviation=row.get("team_abbreviation") or "",
+                    player_age=row.get("player_age"),
+                    gp=row.get("gp") or 0,
+                    gs=row.get("gs") or 0,
+                    min_per_game=row.get("min_per_game"),
+                    pts=row.get("pts"),
+                    reb=row.get("reb"),
+                    ast=row.get("ast"),
+                    stl=row.get("stl"),
+                    blk=row.get("blk"),
+                    tov=row.get("tov"),
+                    pf=row.get("pf"),
+                    fgm=row.get("fgm"),
+                    fga=row.get("fga"),
+                    fg_pct=row.get("fg_pct"),
+                    fg3m=row.get("fg3m"),
+                    fg3a=row.get("fg3a"),
+                    fg3_pct=row.get("fg3_pct"),
+                    ftm=row.get("ftm"),
+                    fta=row.get("fta"),
+                    ft_pct=row.get("ft_pct"),
+                )
+            )
+
+    try:
+        db.commit()
+        db.refresh(player)
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Uložení hráče %s z ESPN selhalo: %s", player_id, exc)
+        db.rollback()
+        return None
+
+    logger.info("Hráč %s načten ze záložního zdroje ESPN (%s sezón)", player_id, len(seasons or []))
+    return player
 
 
 def fetch_and_cache_player(player_id: int, db: Session) -> Optional[Player]:
@@ -419,6 +546,12 @@ def fetch_and_cache_player(player_id: int, db: Session) -> Optional[Player]:
             logger.error(
                 "Hráč %s nebyl nalezen v CommonPlayerInfo (%s).", player_id, last_error or "prázdná odpověď"
             )
+            # NBA API z cloudových serverů neodpovídá vůbec – hráč pak
+            # vypadá jako neexistující. Zkusíme záložní zdroj (ESPN),
+            # který zná jméno, pozici i sezóny.
+            fallback = _player_from_espn(player_id, db)
+            if fallback:
+                return fallback
             return existing
 
         row = info_df.iloc[0]
