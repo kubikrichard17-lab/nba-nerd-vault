@@ -344,8 +344,12 @@ def scoreboard(date_str: str, day_offset: int, team_cz: Dict[str, str]) -> Optio
     """
     Rozpis a výsledky na den – stejný tvar jako `nba_news.get_schedule()`.
 
-    ESPN bere datum jako `YYYYMMDD`.
+    ESPN bere datum jako `YYYYMMDD`; bez data dá dnešní den.
     """
+    if not date_str:
+        from datetime import date
+
+        date_str = date.isoformat(date.today())
     compact = date_str.replace("-", "")
     data = _get_json(f"{ESPN_SCOREBOARD}?dates={compact}")
     if not data:
