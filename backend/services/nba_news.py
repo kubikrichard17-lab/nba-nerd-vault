@@ -357,6 +357,10 @@ def _espn_game_log(season: str, days: int = 21) -> List[Dict[str, Any]]:
             ):
                 mine = _to_int(side.get("score"))
                 theirs = _to_int(other.get("score"))
+                stats = {
+                    key: _to_int((side.get("stats") or {}).get(key))
+                    for key in ("reb", "ast", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta", "tov", "stl", "blk")
+                }
                 rows.append(
                     {
                         "game_id": combined + str(game.get("game_id") or ""),
@@ -369,6 +373,7 @@ def _espn_game_log(season: str, days: int = 21) -> List[Dict[str, Any]]:
                         "pts": mine,
                         "plus_minus": mine - theirs,
                         "opp_pts": theirs,
+                        **stats,
                     }
                 )
     rows.sort(key=lambda r: (r["game_date"], r["game_id"]), reverse=True)
@@ -506,14 +511,14 @@ def get_recent_games(days_back: int = 1) -> Dict[str, Any]:
                     "name": _team_name(home["team"]),
                     "pts": home["pts"],
                     "wl": home["wl"],
-                    "stats": {k: home[k] for k in ("reb", "ast", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta", "tov", "stl", "blk")},
+                    "stats": {k: home.get(k, 0) for k in ("reb", "ast", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta", "tov", "stl", "blk")},
                 },
                 "away": {
                     "abbr": away["team"],
                     "name": _team_name(away["team"]),
                     "pts": away["pts"],
                     "wl": away["wl"],
-                    "stats": {k: away[k] for k in ("reb", "ast", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta", "tov", "stl", "blk")},
+                    "stats": {k: away.get(k, 0) for k in ("reb", "ast", "fgm", "fga", "fg3m", "fg3a", "ftm", "fta", "tov", "stl", "blk")},
                 },
                 "winner": home["team"] if home["pts"] >= away["pts"] else away["team"],
                 "margin": abs(home["pts"] - away["pts"]),
