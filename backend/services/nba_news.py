@@ -55,9 +55,16 @@ def _espn():
 
 # Jak dlouho se čeká, než se to vzdá a sáhne po záložním zdroji.
 # Dřív to byly 3 pokusy po 30 s = 98 s, což je nad limitem prohlížeče
-# i Vercelu – stránka se načetla prázdná. Teď: 2 pokusy, první 20 s.
-NBA_PRIMARY_TIMEOUT = 20
-NBA_PRIMARY_ATTEMPTS = 2
+# i Vercelu – stránka se načetla prázdná.
+# Doma NBA API odpovídá do dvou sekund, na Renderu (datové centrum) ho ale
+# NBA blokuje a každý pokus visí až do timeoutu. Proto se čekání zkracuje
+# na 6 s a jeden pokus – pak nastoupí ESPN a stránka se načte hned.
+NBA_PRIMARY_TIMEOUT = 6
+NBA_PRIMARY_ATTEMPTS = 1
+
+# Přepínač zdroje: "nba" = NBA API první, "espn" = ESPN první.
+# Dá se změnit proměnnou prostředí NBA_DATA_SOURCE.
+ESPN_FIRST = str(__import__("os").environ.get("NBA_DATA_SOURCE", "nba")).lower() == "espn"
 
 
 def _retry(call, attempts: int = NBA_PRIMARY_ATTEMPTS, what: str = "data"):
