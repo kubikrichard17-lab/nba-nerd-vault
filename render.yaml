@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: nba-nerd-vault-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      # Když proměnná chybí, backend povolí všechny adresy (vývoj i telefon).
+      # Pro zpřísnění odkomentuj a doplň adresu frontendu na Vercelu:
+      # - key: ALLOWED_ORIGINS
+      #   value: https://nba-nerd-vault.vercel.app
+      # Volitelné – bez klíče se používají vlastní české texty:
+      # - key: GEMINI_API_KEY
+      #   sync: false
