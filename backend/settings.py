@@ -35,3 +35,8 @@ def allowed_origins() -> List[str]:
         return ["*"]
     origins = [o.strip().rstrip("/") for o in raw.split(",") if o.strip()]
     return origins or ["*"]
+
+
+# Klíč pro Gemini (AI návrh a popisky u „nejbližšího hráče").
+# Nastavuje se proměnnou prostředí, nikdy se neukládá do repozitáře.
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
