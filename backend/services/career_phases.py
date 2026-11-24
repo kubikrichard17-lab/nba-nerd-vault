@@ -266,6 +266,7 @@ def career_phases(
         weight_kg=base_profile.get("weight_kg"),
         stat=prime_stat,
         awards_count=base_profile.get("awards", 0),
+        award_detail=base_profile.get("award_detail"),
     )
     result["prime"] = {
         "season": prime_seasons[0] if prime_seasons else "",
@@ -299,6 +300,7 @@ def career_phases(
             weight_kg=base_profile.get("weight_kg"),
             stat=stat,
             awards_count=base_profile.get("awards", 0),
+            award_detail=base_profile.get("award_detail"),
         )
         phases.append(
             {
