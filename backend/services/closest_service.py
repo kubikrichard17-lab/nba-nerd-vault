@@ -217,7 +217,9 @@ def _resolve_for(profile: Dict[str, Any], pool: List[Dict[str, Any]], label: str
     )
     result = None
     if len(suggested) >= 2:
-        result = closest_player.resolve(profile, pool, suggested=suggested)
+        result = closest_player.resolve(
+            profile, pool, suggested=suggested, allow_below_pool=True
+        )
         # AI smí navrhnout jen hráče, kteří mají co porovnávat. Když z pěti
         # návrhů zbyl jediný (ostatní se nedohledali nebo byli vyloučeni
         # tvrdým filtrem obrany), srovnává se raději podle předvýběru –
