@@ -1069,6 +1069,36 @@ def position_and_size(player_id: int, name: str = "") -> Optional[Dict[str, Any]
 
     if not name:
         name = _name_for(player_id)
+    if not name or name.isdigit():
+        # Bez jména se Basketball-Reference nedá použít – zkusí se ESPN
+        # (na serveru je to jediný zdroj, který odpovídá).
+        try:
+            from services import espn_seasons
+
+            espn_id = espn_seasons.resolve_id(player_id)
+            payload = espn_seasons._get_json(
+                "https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba/"
+                f"athletes/{espn_id}"
+            ) or {}
+            height = _num(payload.get("height"))
+            weight = _num(payload.get("weight"))
+            pos = payload.get("position") or {}
+            position = pos.get("abbreviation") or "" if isinstance(pos, dict) else ""
+            height_cm = height * 2.54 if height and height > 7 else height * 30.48
+            if height_cm:
+                remember_position(
+                    player_id, position, round(height_cm, 1),
+                    round(weight * 0.45359237, 1) if weight else 0.0,
+                )
+                return {
+                    "position": position,
+                    "height_cm": round(height_cm, 1),
+                    "weight_kg": round(weight * 0.45359237, 1) if weight else 0.0,
+                }
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Míry %s z ESPN selhaly: %s", player_id, exc)
+        return value
+
     fallback = bbref_profile(name) if name and not name.isdigit() else None
     if fallback and fallback.get("height_cm"):
         remember_position(
