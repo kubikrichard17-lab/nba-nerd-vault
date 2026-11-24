@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 from services import defense
 
 # Když se změní prompt nebo logika, zvyš číslo – stará cache se přestane používat.
-ENGINE_VERSION = 7
+ENGINE_VERSION = 17
 
 # Kolik kandidátů se AI pošle (víc = horší soustředění, méně = může chybět správný)
 CANDIDATE_LIMIT = 12
@@ -323,7 +323,7 @@ def archetype(p: Dict[str, Any]) -> str:
     # ne tvůrce hry. Tvůrce se pozná podle toho, že dává body hlavně
     # z přihrávek druhým – proto ta podmínka na body.
     # Podkošový tvůrce (Jokič) – vysoký počet asistencí, ale bez velkého skóre
-    if group != "guard" and ast >= 5.0 and pts < 22.0 and p["blk"] < 1.5:
+    if group == "big" and ast >= 5.0 and pts < 22.0 and p["blk"] < 1.5:
         return "post_hub"
 
     # Vysoký střelec s málo asistencemi = vytahující se pivot (Dirk),
@@ -369,6 +369,8 @@ def archetype(p: Dict[str, Any]) -> str:
         # Jordan (1988) měl 6,2 asistence – hranice pro čistého střelce
         # musí být výš, jinak by se z něj stal tvůrce hry. Tvůrce hry
         # pozná podle toho, že přihrávkami opravdu řídí hru (6,5+).
+        # A bez trojky se z hráče nestane tvůrce hry na křídle: křídlo
+        # s asistencí a bez trojky je obránce, ne point forward.
         # Jordan 1988 dal 35 bodů na 25 střelách a přidal 6 asistencí –
         # to je střelec, který v dobré sezóně i přihrává, ne tvůrce hry.
         # Tvůrce hry musí mít VÍC asistencí než doskoků a objem střelby
@@ -388,12 +390,16 @@ def archetype(p: Dict[str, Any]) -> str:
         # Vysoký tvůrce, který doskakuje a hraje vlastním tempem – Luka
         if ast >= 7.5 and pts >= 25.0 and p["reb"] >= 6.5 and fg3m >= 1.5:
             return "big_creator"         # Luka
-        if ast >= 6.0 and pts >= 20.0:
+        if ast >= 6.0 and pts >= 20.0 and fg3m >= 0.8:
             # Křídlo, které skóruje hlavně z trojek a tvoří, je střelec
             # s přehledem (Durant), ne rozehrávající forward (LeBron).
             if p.get("three_pts_share", 0.0) >= 0.18:
                 return "scoring_wing"
             return "point_forward"       # LeBron, Bird
+        # Křídlo bez trojky s asistencí = obránce a hráč bez míče
+        # (Pippen, Kawhi), ne rozehrávač hry.
+        if ast >= 4.0 and fg3m < 0.8 and p.get("fta", 0) < 6.5:
+            return "two_way_wing"
         # Síla a atletičnost pod košem, ne střelba – Giannis, Zion.
         # Rozhoduje podíl bodů z trojek: křídlo, které dává 22 % bodů
         # z trojek, není stejný typ jako to, které dává 8 %. Musí k tomu
@@ -414,7 +420,7 @@ def archetype(p: Dict[str, Any]) -> str:
         return "two_way_wing"
     # podkošoví
     # Jokić: podkošový tvůrce hry – vysoký počet asistencí a hodně střel
-    if ast >= 5.0 and p["blk"] < 1.5:
+    if group == "big" and ast >= 5.0 and p["blk"] < 1.5:
         return "post_hub"                # Jokić, Sabonis
     if three_rate >= 0.30 and ast < 3.5:
         return "stretch_big"             # Dirk, Markkanen
@@ -469,6 +475,18 @@ def build_profile(
     blk = _num(stat.get("blk"))
     tov = _num(stat.get("tov"))
     fga = max(_num(stat.get("fga"), 1.0), 1.0)
+    # Kandidát z ESPN nemá v sezónní tabulce trojky. Kdyby se braly jako
+    # nula, vyšel by z něj „hráč bez střelby" – proto se odhadnou z objemu
+    # střelby a šestek, aby se nestřelec nepletl se střelcem.
+    if stat.get("fg3a") is None:
+        stat = dict(stat)
+        fta_guess = _num(stat.get("fta"), 0.0)
+        three_guess = max(fga * 0.25 - fta_guess * 0.4, 0.6)
+        stat["fg3a"] = round(min(three_guess, fga * 0.6), 2)
+        stat["fg3m"] = round(stat["fg3a"] * 0.35, 2)
+        stat["fgm"] = _num(stat.get("fgm"), 0.0) or round(
+            (_num(stat.get("pts"), 0.0) - 0.44 * fta_guess - 3 * stat["fg3m"]) / 2.0, 2
+        )
     fg3a = _num(stat.get("fg3a"))
     fg3m = _num(stat.get("fg3m"))
     fgm = _num(stat.get("fgm"))
@@ -649,8 +667,15 @@ def build_profile(
 def apply_awards(profile: Dict[str, Any], detail: Dict[str, int]) -> Dict[str, Any]:
     """Doplní ocenění (DPOY, All-Defensive…) a přepočte obrannou úroveň."""
     profile["award_detail"] = dict(detail or defense.empty_awards())
+    # Zisky a bloky jsou na zápas; defense_tier si je sám přepočítá na
+    # 100 držení podle minut a tempa éry.
     profile["defense_tier"] = defense.defense_tier(
-        profile.get("stl100"), profile.get("blk100"), profile.get("role_group", ""), profile["award_detail"]
+        profile.get("stl"),
+        profile.get("blk"),
+        profile.get("role_group", ""),
+        profile["award_detail"],
+        minutes=profile.get("min_per_game"),
+        season=(profile.get("seasons") or [None])[0],
     )
     profile["defense_label"] = defense.DEFENSE_LABEL[profile["defense_tier"]]
     total = sum(profile["award_detail"].values())
@@ -763,15 +788,22 @@ def preselect(
     def same_caliber(c: Dict[str, Any]) -> bool:
         """
         Role player není „druhý nejpodobnější" hráč hvězdy. Hráč, který dá
-        14 bodů, není srovnatelný s hráčem na 19+.
+        14 bodů, není srovnatelný s hráčem na 19+. Rozdíl se měří podílem,
+        aby superstar (35 b) nespadla na kandidáta s 21 body – což je
+        rozdíl 40 %, ne „podobný hráč".
         """
         gap = abs(c["pts"] - target["pts"])
         if target["pts"] >= 17.0:
-            return gap <= 5.5
+            return gap <= 5.5 and gap <= max(0.30 * target["pts"], 3.0)
         return gap <= 6.0
 
     def nearby_tier(c: Dict[str, Any]) -> bool:
-        # superstar a all-star jsou sousedé, role player je až další úroveň
+        # superstar a all-star jsou sousedé, role player je až další úroveň.
+        # U kandidátů z ESPN ale kategorie dopadu vzniká z jedné sezóny,
+        # takže se superstar (35 b, MVP) nesmí srovnávat s hráčem, který
+        # má 21 bodů a žádné ocenění.
+        if target["tier"] == "superstar":
+            return c["pts"] >= 0.72 * target["pts"] and c["tier"] != "role_player"
         strong = {"superstar", "all_star"}
         return (c["tier"] in strong) == (target["tier"] in strong)
 
@@ -781,7 +813,13 @@ def preselect(
     def related_arch(c: Dict[str, Any]) -> bool:
         """Sousední archetypy: skórující SG a střelec bez míče mají k sobě blízko."""
         pair = {target["archetype"], c["archetype"]}
-        return bool(pair & _RELATED_ARCHETYPES.get(target["archetype"], set())) and len(pair) == 2
+        if not pair & _RELATED_ARCHETYPES.get(target["archetype"], set()) or len(pair) != 2:
+            return False
+        # Sousední archetyp nestačí, když se jeden trefuje z dálky a druhý
+        # ne (KD a Siakam) – pak to nejsou podobní hráči.
+        if abs(target.get("gravity", 1) - c.get("gravity", 1)) >= 2:
+            return False
+        return True
 
     def family(c: Dict[str, Any]) -> int:
         """
@@ -826,6 +864,9 @@ def preselect(
         )
         if share_gap > 0.18:
             return 15
+        # Střelecký profil: elitní trojkař a hráč bez trojky nejsou stejný typ
+        if abs(target.get("gravity", 1) - c.get("gravity", 1)) >= 2:
+            return 16
         # 0 = stejný archetyp i pozice; 1 = stejný archetyp, jiná pozice;
         # 2 = stejná kategorie a pozice; 3 = stejná kategorie; dál slabší shody.
         if fam == 0 and pos_ok:
@@ -1110,11 +1151,26 @@ def _similarity(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, float]:
     stats = _clamp(stats - min(abs(aw_a - aw_b) * 1.2, 10.0))
 
     # Styl a fyzično rozhodují o tom, kdo je „nejbližší hráč"; statistiky
-    # jsou jen doplňková kontrola, proto váží nejméně.
-    total = 0.68 * style + 0.24 * physical + 0.08 * stats
+    # (vrchol na 100 držení a ocenění) jsou kontrola, proto váží méně.
+    total = 0.62 * style + 0.22 * physical + 0.16 * stats
+    # Kategorie dopadu: superstar (35 b) a hráč na 21 bodů nejsou „stejní".
+    # Rozdíl v objemu bodů se počítá podílem, ne rozdílem.
+    if a.get("pts") and b.get("pts"):
+        ratio = min(a["pts"], b["pts"]) / max(a["pts"], b["pts"])
+        if ratio < 0.85:
+            total -= (0.85 - ratio) * 90.0
+    # Elitní obránce (DPOY) a slabý obránce nejsou „nejbližší hráči",
+    # ani když sedí čísla i postava – srážka se propíše do celkového čísla.
+    tier_penalty = defense.defense_penalty(
+        a.get("defense_tier", "average"), b.get("defense_tier", "average")
+    )
+    if tier_penalty:
+        total -= tier_penalty * 0.6
     # Strop: stejný styl nestačí na 99 %, když se hráči liší postavou.
+    # Dřív tu byl strop 70 + 0,28 × fyzično, který shodil i dvojice se
+    # shodou 95 % ve stylu (Jordan–Kobe na 68,7 %).
     if physical < 95.0:
-        total = min(total, 70.0 + physical * 0.28)
+        total = min(total, 78.0 + physical * 0.21)
     return {
         "match_pct": round(min(99.0, _clamp(total)), 1),
         "style_pct": round(min(99.0, _clamp(style)), 1),
@@ -1279,6 +1335,13 @@ def resolve(
         # AI smí vybrat jen z kandidátů; když se netrefí, vezme se první z top 3
         chosen = picked or (by_name.get(_norm(top_three[0]["name"])) if top_three else None)
 
+    if chosen is not None and not suggested_mode:
+        # AI nesmí prosadit volbu, která je matematicky výrazně horší než
+        # nejpodobnější kandidát (rozhoduje matematika, AI jen navrhuje).
+        best = max(candidates, key=lambda c: _similarity(target, c)["match_pct"])
+        if _similarity(target, best)["match_pct"] - _similarity(target, chosen)["match_pct"] > 6.0:
+            chosen = best
+
     if suggested_mode:
         # matematika přebíjí AI: vítěz = nejvyšší shoda mezi navrženými
         ranked = sorted(candidates, key=lambda c: (-_similarity(target, c)["match_pct"], c["id"]))
@@ -1293,8 +1356,14 @@ def resolve(
         # dostal Shai Gilgeous-Alexandera místo Kobeho).
         # Mezi nimi rozhoduje pořadí předvýběru, ne procenta – stejná role
         # a archetyp je důležitější než to, že čísla sedí o pár bodů víc.
+        # Z pěti nejlepších z předvýběru vyhraje ten s nejvyšší reálnou
+        # shodou. Dřív se bral první z pořadí, což dalo Kawhimu Cadea
+        # Cunninghama (91 %) místo skutečně podobného křídla.
         head = [c for c in candidates if c["id"] != target["id"]][:5]
-        chosen = head[0] if head else candidates[0]
+        if head:
+            chosen = max(head, key=lambda c: (_similarity(target, c)["match_pct"], -c["id"]))
+        else:
+            chosen = candidates[0]
         ordered = sorted(
             [c for c in candidates if c["id"] != target["id"]],
             key=lambda c: -_similarity(target, c)["match_pct"],
