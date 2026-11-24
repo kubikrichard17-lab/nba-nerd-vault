@@ -13,7 +13,7 @@ smaže, aby se nezobrazovaly výsledky z dřívějšího (kariérního) modelu.
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from services import closest_player, nba_external
 from services.career_phases import career_phases
@@ -80,19 +80,53 @@ def _decorate(result: Dict[str, Any], match, db) -> Dict[str, Any]:
     return result
 
 
+def _find_player(name: str) -> Tuple[Optional[int], str]:
+    """
+    Najde hráče podle jména: nejdřív databáze aplikace, pak registr NBA.
+    V cloudu (ESPN) je registr NBA nedostupný, takže bez databáze by
+    navržení kandidáti neměli odkud vzít sezóny.
+    """
+    try:
+        import models
+        from database import SessionLocal
+        from services.espn_seasons import _plain
+
+        session = SessionLocal()
+        try:
+            rows = session.query(models.Player).all()
+        finally:
+            session.close()
+        wanted = _plain(name)
+        for row in rows:
+            if _plain(row.full_name) == wanted:
+                return int(row.id), row.full_name
+        for row in rows:
+            if wanted and wanted in _plain(row.full_name):
+                return int(row.id), row.full_name
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Hráče %s nešlo najít v databázi: %s", name, exc)
+
+    try:
+        from nba_api.stats.static import players as nba_players
+
+        found = nba_players.find_players_by_full_name(name)
+        exact = [p for p in found if p["full_name"].lower() == name.lower()] or found
+        if exact:
+            return int(exact[0]["id"]), exact[0]["full_name"]
+    except Exception:
+        pass
+    return None, name
+
+
 def _profile_by_name(name: str) -> Optional[Dict[str, Any]]:
     """
     Prime profil hráče stažený za běhu (jen pro navržené kandidáty).
     Nic se neukládá do databáze; sezóny i ocenění jdou přes dočasnou paměť.
     """
     try:
-        from nba_api.stats.static import players as nba_players
-
-        found = nba_players.find_players_by_full_name(name)
-        exact = [p for p in found if p["full_name"].lower() == name.lower()] or found
-        if not exact:
+        pid, full = _find_player(name)
+        if not pid:
             return None
-        pid, full = int(exact[0]["id"]), exact[0]["full_name"]
 
         from services import nba_fetcher
 
