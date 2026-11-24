@@ -861,6 +861,7 @@ def _espn_league_rows(season: str) -> List[Dict[str, Any]]:
             "name": athlete.get("displayName") or athlete.get("fullName") or "",
         }
         row.update(values)
+        row["season"] = season
         size = _cache_get(f"size:{espn_id}", TTL_STATS) or {}
         row["position"] = size.get("position") or ""
         row["height_cm"] = size.get("height_cm") or 0.0
@@ -890,12 +891,13 @@ def _espn_league_rows(season: str) -> List[Dict[str, Any]]:
 
     # ESPN posílá sezónní SOUČTY, aplikace počítá s průměry na zápas.
     pct_keys = {"fg_pct", "fg3_pct", "ft_pct"}
+    keep_keys = {"gp", "name", "position", "height_cm", "weight_kg", "id", "espn_id", "season"}
     for row in rows:
         games = row.pop("gp", 0.0) or 0.0
         row["gp"] = games
         if games > 0:
             for key in list(row.keys()):
-                if key in pct_keys or key in ("gp", "name", "position", "height_cm", "weight_kg"):
+                if key in pct_keys or key in keep_keys:
                     continue
                 value = row.get(key)
                 if isinstance(value, (int, float)):
@@ -974,6 +976,13 @@ def _cached_players() -> List[Dict[str, Any]]:
 
 
 def _name_for(player_id: int) -> str:
+    """
+    Jméno hráče podle ID: registr NBA, jinak paměť aplikace.
+
+    V cloudu registr NBA nefunguje, takže se jméno bere z kariérních
+    profilů, které si aplikace už uložila – bez jména by se nedalo
+    přeložit ESPN ID a hráč by „zmizel".
+    """
     try:
         from nba_api.stats.static import players as nba_players
 
@@ -982,6 +991,15 @@ def _name_for(player_id: int) -> str:
                 return info["full_name"]
     except Exception:
         pass
+
+    entry = _load_memory()["entries"].get(f"nba:{player_id}") or {}
+    value = entry.get("v") or {}
+    if value.get("name"):
+        return str(value["name"])
+
+    size = _cache_get(f"size:{player_id}", TTL_PROFILE) or {}
+    if size.get("name"):
+        return str(size["name"])
     return str(player_id)
 
 
@@ -1141,6 +1159,399 @@ def _nba_position_size(player_id: int) -> Optional[Dict[str, Any]]:
     }
     _cache_set(key, value)
     return value
+
+
+_ALL_PLAYERS_TTL = 7 * 24 * 3600
+_LEGEND_TTL = 30 * 24 * 3600
+
+
+def _espn_legends() -> List[Dict[str, Any]]:
+    """
+    Legendy, které v sezónní tabulce nejsou (Kobe, Pippen, Wade, Jordan).
+
+    ESPN je má ve svém seznamu hráčů NBA podle abecedy, jen ne v sezónní
+    tabulce. Načtou se jednou za 30 dní – jsou to stovky dotazů, ale jen
+    jednou, a pak se drží v paměti.
+    """
+    key = "legends"
+    cached = _cache_get(key, _LEGEND_TTL)
+    if cached is not None:
+        return cached or []
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    from services import espn_seasons
+
+    # seznam všech hráčů NBA v ESPN (bez sezóny) – odkazy po 25
+    refs: List[int] = []
+    page = 1
+    while True:
+        url = (
+            "https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba"
+            f"/athletes?limit=100&page={page}"
+        )
+        try:
+            data = json.loads(_http_get(url, timeout=40) or "{}")
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Seznam hráčů ESPN (strana %d) selhal: %s", page, exc)
+            break
+        items = (data or {}).get("items") or []
+        if not items:
+            break
+        for item in items:
+            ref = ((item.get("$ref")) or "").split("?")[0]
+            parts = ref.rsplit("/athletes/", 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                refs.append(int(parts[1]))
+        pages = int(_num((data or {}).get("pageCount"), 1))
+        if page >= pages or page >= 80:
+            break
+        page += 1
+
+    if not refs:
+        return []
+
+    # Do seznamu legend patří i hráči, kteří v ESPN nejsou vedení jako
+    # neaktivní (Jordan, Pippen). Bere se proto každý, kdo má v ESPN
+    # kariérní statistiky a není to aktuální hráč ze sezónní tabulky.
+    active_ids = set()
+    try:
+        for row in _espn_all_players("2025-26"):
+            active_ids.add(int(row["id"]))
+    except Exception:  # pragma: no cover
+        pass
+
+    def fetch(espn_id: int) -> Optional[Dict[str, Any]]:
+        if espn_id in active_ids:
+            return None
+        payload = espn_seasons._get_json(
+            "https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba"
+            f"/athletes/{espn_id}"
+        ) or {}
+        name = (payload.get("fullName") or payload.get("displayName") or "").strip()
+        if not name:
+            return None
+        # jen hráči s odehranou kariérou (seznam obsahuje i lidi bez zápasů)
+        if not (payload.get("statistics") or {}).get("$ref"):
+            return None
+        height = _num(payload.get("height"))
+        weight = _num(payload.get("weight"))
+        pos = payload.get("position") or {}
+        return {
+            "id": espn_id,
+            "espn_id": espn_id,
+            "name": name,
+            "position": (pos.get("abbreviation") or "") if isinstance(pos, dict) else "",
+            "height_cm": round(height * 2.54, 1) if height else 0.0,
+            "weight_kg": round(weight * 0.45359237, 1) if weight else 0.0,
+            "legend": True,
+        }
+
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        rows = [r for r in pool.map(fetch, refs) if r]
+
+    # Seznam odkazů nemusí obsahovat všechny hráče – doplní se jmenovitě
+    # ti, které AI nejčastěji navrhuje jako obdobu současných hvězd.
+    # Dohledají se přes vyhledávání ESPN (jedno jméno = jeden dotaz).
+    have = {r["name"].lower() for r in rows}
+    extra_names = [
+        "Michael Jordan", "Kobe Bryant", "Scottie Pippen", "Dwyane Wade",
+        "Hakeem Olajuwon", "Patrick Ewing", "Reggie Miller", "Ray Allen",
+        "Paul Pierce", "Tracy McGrady", "Allen Iverson", "Vince Carter",
+        "Kevin Garnett", "Tim Duncan", "Dirk Nowitzki", "Steve Nash",
+        "Jason Kidd", "Gary Payton", "Shaquille O'Neal", "David Robinson",
+        "Karl Malone", "John Stockton", "Charles Barkley", "Scottie Barnes",
+        "Penny Hardaway", "Grant Hill", "Chris Webber", "Detlef Schrempf",
+        "Peja Stojakovic", "Rashard Lewis", "Manu Ginobili", "Tony Parker",
+        "Chauncey Billups", "Ben Wallace", "Ron Artest", "Shane Battier",
+        "Andre Iguodala", "Klay Thompson", "Draymond Green", "Blake Griffin",
+        "Kevin Love", "LaMarcus Aldridge", "Pau Gasol", "Marc Gasol",
+    ]
+
+    def fetch_named(name: str) -> Optional[Dict[str, Any]]:
+        if name.lower() in have:
+            return None
+        espn_id = espn_seasons.search_athlete(name)
+        if not espn_id or espn_id in active_ids:
+            return None
+        return fetch(espn_id)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        for row in pool.map(fetch_named, extra_names):
+            if row:
+                rows.append(row)
+
+    if rows:
+        _cache_set(key, rows)
+    logger.info("ESPN legendy: %d hráčů", len(rows))
+    return rows
+
+
+def _espn_all_players(season: str) -> List[Dict[str, Any]]:
+    """
+    Všichni hráči ligy ze sezónní tabulky ESPN (jeden dotaz).
+
+    Kdřív se bralo jen 200 nejlepších podle bodů, takže legenda mimo
+    tento seznam (Kobe, Pippen, Wade) v nabídce vůbec nebyla. ESPN posílá
+    celou tabulku v jednom dokumentu – načte se jednou a drží se 7 dní.
+    """
+    from services import espn_seasons
+
+    year = _espn_season_start(season)
+    if not year:
+        return []
+    key = f"allplayers:{year}"
+    cached = _cache_get(key, _ALL_PLAYERS_TTL)
+    if cached is not None:
+        return cached or []
+
+    url = (
+        "https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba"
+        f"/seasons/{year}/athletes?limit=1200"
+    )
+    # ESPN posílá jen odkazy (25 na stránku), jméno je až v detailu hráče.
+    # Stáhne se všech ~770 odkazů a jména paralelně – jednou za 7 dní.
+    from concurrent.futures import ThreadPoolExecutor
+
+    refs: List[int] = []
+    page = 1
+    while True:
+        page_url = url + f"&page={page}"
+        try:
+            data = json.loads(_http_get(page_url, timeout=40) or "{}")
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Seznam hráčů ESPN (strana %d) selhal: %s", page, exc)
+            break
+        items = (data or {}).get("items") or []
+        if not items:
+            break
+        for item in items:
+            ref = ((item.get("$ref")) or "").split("?")[0]
+            parts = ref.rsplit("/athletes/", 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                refs.append(int(parts[1]))
+        pages = int(_num((data or {}).get("pageCount"), 1))
+        if page >= pages or page >= 40:
+            break
+        page += 1
+
+    if not refs:
+        logger.warning("ESPN nevrátil seznam hráčů pro %s", season)
+        return []
+
+    def fetch(espn_id: int) -> Optional[Dict[str, Any]]:
+        payload = espn_seasons._get_json(
+            "https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba"
+            f"/athletes/{espn_id}"
+        ) or {}
+        name = (payload.get("fullName") or payload.get("displayName") or "").strip()
+        if not name:
+            return None
+        height = _num(payload.get("height"))
+        weight = _num(payload.get("weight"))
+        pos = payload.get("position") or {}
+        return {
+            "id": espn_id,
+            "espn_id": espn_id,
+            "name": name,
+            "position": (pos.get("abbreviation") or "") if isinstance(pos, dict) else "",
+            "height_cm": round(height * 2.54, 1) if height else 0.0,
+            "weight_kg": round(weight * 0.45359237, 1) if weight else 0.0,
+        }
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        rows = [r for r in pool.map(fetch, refs) if r]
+
+    if rows:
+        _cache_set(key, rows)
+    logger.info("ESPN seznam hráčů %s: %d jmen", season, len(rows))
+    return rows
+
+
+def _all_player_pool() -> List[Dict[str, Any]]:
+    """
+    Nabídka kandidátů pro „nejbližšího hráče" = všichni hráči z ESPN
+    (jméno + ID) a k tomu profily, které už aplikace zná.
+
+    Statistiky se u kandidátů dotahují až podle podobnosti (viz
+    closest_service), takže se nemusí stahovat celá liga.
+    """
+    key = "allpool"
+    cached = _cache_get(key, TTL_STATS)
+    if cached is not None:
+        return cached or []
+
+    by_id: Dict[int, Dict[str, Any]] = {}
+    for row in _cached_players():
+        if row.get("id"):
+            by_id[int(row["id"])] = dict(row)
+
+    # Stačí aktuální sezóna – v té jsou všichni hráči ligy. Starší sezóny
+    # se přidají, jen když ta aktuální nic nevrátí.
+    seasons = ["2025-26"]
+    try:
+        from services import nba_news
+
+        current = nba_news.current_season()
+        if current:
+            seasons = [current]
+    except Exception:  # pragma: no cover
+        pass
+
+    # Základ nabídky: sezónní tabulka s čísly (200 nejlepších podle bodů).
+    # Odsud se dá počítat hned, bez dalších dotazů. Data se pamatují i
+    # kariérně – hráč tak zůstane v nabídce i v příští sezóně.
+    for season in seasons:
+        for row in _espn_league_rows(season):
+            pid = int(row["id"])
+            if pid and pid not in by_id:
+                by_id[pid] = dict(row)
+                remember_career(pid, row.get("name") or "", row)
+
+    # K tomu všichni hráči ligy a legendy – zatím jen jméno a míry,
+    # statistiky se jim dotahují až podle podobnosti (a drží se v paměti).
+    for season in seasons:
+        for row in _espn_all_players(season):
+            pid = int(row["id"])
+            if pid in by_id:
+                by_id[pid].setdefault("name", row["name"])
+                continue
+            by_id[pid] = {
+                "id": pid,
+                "espn_id": pid,
+                "name": row["name"],
+                "gp": 0,
+                "pts": 0.0,
+                "position": row.get("position") or "",
+                "height_cm": row.get("height_cm") or 0.0,
+                "weight_kg": row.get("weight_kg") or 0.0,
+            }
+
+    # Legendy mimo sezónní tabulku – jinak by Kobe, Pippen nebo Wade
+    # v nabídce vůbec nebyli.
+    for row in _espn_legends():
+        pid = int(row["id"])
+        if pid in by_id:
+            continue
+        by_id[pid] = dict(row)
+
+    pool = _link_nba_ids(list(by_id.values()))
+    if pool:
+        _cache_set(key, pool)
+    logger.info("Nabídka hráčů pro nejbližšího hráče: %d", len(pool))
+    return pool
+
+
+def _link_nba_ids(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Převede ESPN ID na NBA ID tam, kde hráče zná paměť aplikace.
+
+    ESPN a NBA mají jiná čísla (LeBron 1966 vs 2544). Bez převodu vzniknou
+    v nabídce dvě verze stejného hráče – jedna s čísly, druhá bez nich.
+    """
+    try:
+        from services.espn_seasons import _plain
+    except Exception:  # pragma: no cover
+        return rows
+
+    by_name: Dict[str, int] = {}
+    for key, entry in _load_memory()["entries"].items():
+        if not key.startswith("nba:"):
+            continue
+        value = entry.get("v") or {}
+        name = _plain(value.get("name") or "")
+        if name:
+            by_name.setdefault(name, int(key.split(":", 1)[1]))
+
+    for row in rows:
+        name = _plain(row.get("name") or "")
+        nba_id = by_name.get(name)
+        if nba_id and int(row.get("id") or 0) != nba_id:
+            row["espn_id"] = int(row.get("id") or 0)
+            row["id"] = nba_id
+    return rows
+
+
+def _season_rows(player_id: int, season: str) -> Optional[Dict[str, Any]]:
+    """Statistiky hráče v jedné sezóně z ESPN (per-game), kešované."""
+    key = f"srow:{player_id}:{season}"
+    cached = _cache_get(key, TTL_STATS)
+    if cached is not None:
+        return cached or None
+
+    from services import espn_seasons
+
+    espn_id = espn_seasons.resolve_id(player_id)
+    year = _espn_season_start(season)
+    if not year:
+        return None
+    values = espn_seasons._split_stats(
+        "https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba"
+        f"/seasons/{year}/types/2/athletes/{espn_id}/statistics/0"
+    )
+    row = espn_seasons._to_row(season, values) if values else None
+    if row:
+        _cache_set(key, row)
+    return row
+
+
+def fill_candidate_stats(
+    rows: List[Dict[str, Any]], seasons: Optional[List[str]] = None
+) -> List[Dict[str, Any]]:
+    """
+    Doplní statistiky kandidátům, kteří přišli jen se jménem.
+
+    Sezónní tabulka ESPN má jen 200 nejlepších podle bodů, legenda nebo
+    hráč mimo ni přišel bez čísel. Tady se dohledá jeho nejlepší sezóna
+    (jednou, s pamětí), aby měl z čeho počítat podobnost.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    seasons = seasons or ["2025-26", "2024-25", "2023-24"]
+    need = [r for r in rows if not _num(r.get("gp"))]
+    if not need:
+        return rows
+
+    def lookup(row: Dict[str, Any]) -> Dict[str, Any]:
+        # Legenda nemá v aktuální sezóně nic – bere se její nejsilnější
+        # sezóna z kariérního logu (jedno volání, pak z paměti).
+        try:
+            from services import espn_seasons
+
+            history = espn_seasons.player_season_stats(int(row["id"])) or []
+            if history:
+                best = max(
+                    history,
+                    key=lambda r: _num(r.get("pts")) * min(_num(r.get("gp")), 70.0),
+                )
+                merged = dict(row)
+                merged.update({k: v for k, v in best.items() if v is not None})
+                merged["id"] = row["id"]
+                merged["name"] = row.get("name") or best.get("name") or ""
+                merged["season"] = best.get("season_id")
+                return merged
+        except Exception:  # pragma: no cover
+            pass
+
+        for season in seasons:
+            stat = _season_rows(int(row["id"]), season)
+            if stat and _num(stat.get("gp")) >= 20:
+                merged = dict(row)
+                merged.update({k: v for k, v in stat.items() if v is not None})
+                merged["id"] = row["id"]
+                merged["name"] = row.get("name") or stat.get("name") or ""
+                merged["season"] = season
+                return merged
+        return row
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        filled = list(pool.map(lookup, need))
+
+    by_id = {int(r["id"]): r for r in filled}
+    out: List[Dict[str, Any]] = []
+    for row in rows:
+        out.append(by_id.get(int(row["id"]), row))
+    return out
 
 
 def _league_season(season: str) -> List[Dict[str, Any]]:
