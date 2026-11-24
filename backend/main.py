@@ -652,7 +652,12 @@ def _external_pool(external: Optional[Dict[str, Any]], target_id: int) -> List[D
         # Když chybí pozice nebo výška, dohledá se profil hráče – jen pro
         # kandidáty, kteří projdou filtrem, ne pro celou ligu.
         if not profile.get("height_cm") or not profile.get("position"):
+            # V cloudu je NBA API zablokované a sezónní tabulka ESPN míry
+            # nemá – dohledá se jen to, co už aplikace zná (paměť), plus
+            # u hráčů bez míry profil z ESPN (jen pro kandidáty z filtru).
             details = nba_external.known_position(row["id"])
+            if not details or not details.get("height_cm"):
+                details = nba_external.position_and_size(row["id"], row["name"]) or details
             if details:
                 profile.setdefault("position", "")
                 profile["position"] = profile.get("position") or details.get("position", "")
