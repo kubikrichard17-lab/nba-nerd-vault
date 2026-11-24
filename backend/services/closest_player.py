@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 from services import defense
 
 # Když se změní prompt nebo logika, zvyš číslo – stará cache se přestane používat.
-ENGINE_VERSION = 18
+ENGINE_VERSION = 19
 
 # Kolik kandidátů se AI pošle (víc = horší soustředění, méně = může chybět správný)
 CANDIDATE_LIMIT = 12
@@ -1288,6 +1288,7 @@ def resolve(
     pool: List[Dict[str, Any]],
     use_ai: bool = True,
     suggested: Optional[List[Dict[str, Any]]] = None,
+    allow_below_pool: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """
     Vybere nejbližšího hráče. AI rozhoduje o stylu, backend dodává čísla.
@@ -1347,6 +1348,14 @@ def resolve(
         ranked = sorted(candidates, key=lambda c: (-_similarity(target, c)["match_pct"], c["id"]))
         chosen = ranked[0]
         top_three = [{"id": c["id"], "name": c["name"], "why": ""} for c in ranked[:3]]
+        # Když jsou navržení hráči slabší kategorií než cílový hráč, nesmí
+        # vyhrát jen proto, že AI jiného nenavrhla. Srovnává se s celým
+        # seznamem kandidátů, kde jsou i hráči ze stejné kategorie dopadu.
+        # (Kawhi tak místo Jarena Jacksona dostane křídlo stejné úrovně.)
+        if allow_below_pool and ranked[0]["pts"] < 0.85 * target["pts"]:
+            best = resolve(target, pool, use_ai=False)
+            if best and best["closest"]["match_pct"] >= _similarity(target, ranked[0])["match_pct"]:
+                return best
 
     if chosen is None:
         # Bez AI rozhoduje pořadí předvýběru: nejdřív se hledá mezi hráči,
