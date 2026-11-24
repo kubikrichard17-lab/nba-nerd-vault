@@ -814,6 +814,56 @@ def get_closest_player(
     return result
 
 
+_HEADSHOT_CACHE: Dict[int, tuple] = {}
+_HEADSHOT_TTL = 24 * 3600
+
+
+@app.get("/api/players/{player_id}/headshot")
+def get_headshot(player_id: int, db: Session = Depends(get_db)):
+    """
+    Ověřená fotka hráče. Pořadí: 1) oficiální NBA CDN s přesným player_id,
+    2) Basketball-Reference podle jména hráče z registru NBA,
+    3) nic (frontend ukáže iniciály). Nikdy se nehledá „podobné" jméno.
+    """
+    import time
+    import urllib.request
+
+    now = time.time()
+    hit = _HEADSHOT_CACHE.get(player_id)
+    if hit and now - hit[0] < _HEADSHOT_TTL:
+        return hit[1]
+
+    def exists(url: str) -> bool:
+        try:
+            req = urllib.request.Request(url, method="HEAD", headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=6) as resp:
+                ctype = str(resp.headers.get("Content-Type") or "")
+                return resp.status == 200 and ctype.startswith("image")
+        except Exception:
+            return False
+
+    result: Dict[str, Any] = {"url": "", "source": "none"}
+    cdn = f"https://cdn.nba.com/headshots/nba/latest/1040x760/{player_id}.png"
+    if exists(cdn):
+        result = {"url": cdn, "source": "nba"}
+    else:
+        try:
+            from services import nba_external
+            from services.nba_fetcher import canonical_name
+
+            name = canonical_name(player_id) or ""
+            slug = nba_external.bbref_slug(name) if name else None
+            if slug:
+                url = f"https://www.basketball-reference.com/req/202106291/images/headshots/{slug}.jpg"
+                if exists(url):
+                    result = {"url": url, "source": "basketball-reference"}
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Fotka %s z Basketball-Reference nešla: %s", player_id, exc)
+
+    _HEADSHOT_CACHE[player_id] = (now, result)
+    return result
+
+
 @app.get("/api/players/{player_id}/last-game")
 def get_last_game(player_id: int):
     """Return stats from the player's last played game using NBA API PlayerGameLog."""
