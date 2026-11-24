@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 from services import defense
 
 # Když se změní prompt nebo logika, zvyš číslo – stará cache se přestane používat.
-ENGINE_VERSION = 19
+ENGINE_VERSION = 20
 
 # Kolik kandidátů se AI pošle (víc = horší soustředění, méně = může chybět správný)
 CANDIDATE_LIMIT = 12
@@ -1045,7 +1045,26 @@ def _gemini_key() -> Optional[str]:
         return None
 
 
+# Modely se zkoušejí popořadě – když je jeden přetížený (503) nebo zrušený
+# (404), odpoví další. První, který vrátí JSON, vyhrává.
+GEMINI_MODELS = [
+    m.strip()
+    for m in os.environ.get(
+        "GEMINI_MODELS",
+        "gemini-3.5-flash-lite,gemini-flash-lite-latest,gemini-3.8-flash-lite,gemini-3.8-flash",
+    ).split(",")
+    if m.strip()
+]
+
+
+# Poslední úspěšná odpověď – když jsou všechny modely přetížené, použije se
+# tato, aby se výsledek u stejného hráče neměnil mezi dvěma načteními.
+_LAST_AI: Dict[str, Dict[str, Any]] = {}
+_LAST_AI_LIMIT = 200
+
+
 def _call_gemini_json(prompt: str) -> Optional[Dict[str, Any]]:
+    """Zkusí modely popořadě; vrátí první rozumnou JSON odpověď."""
     api_key = _gemini_key()
     if not api_key:
         logger.warning("AI výběr nejbližšího hráče: chybí GEMINI_API_KEY")
@@ -1053,194 +1072,54 @@ def _call_gemini_json(prompt: str) -> Optional[Dict[str, Any]]:
     try:
         from google import genai
         from google.genai import types
-
-        client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=15000))
-        response = client.models.generate_content(
-            model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                temperature=0,
-                top_p=0,
-                top_k=1,
-                seed=7,
-                response_mime_type="application/json",
-                system_instruction=SYSTEM_PROMPT,
-            ),
-        )
-        text = (response.text or "").strip()
-        if text.startswith("```"):
-            text = text.strip("`")
-            text = text[text.find("{") :]
-        data = json.loads(text)
-        return data if isinstance(data, dict) else None
     except Exception as exc:  # pragma: no cover
-        logger.warning("AI výběr nejbližšího hráče selhal (použije se předvýběr): %s", exc)
+        logger.warning("Knihovna google-genai není k dispozici: %s", exc)
         return None
 
+    forced = os.environ.get("GEMINI_MODEL")
+    models = [forced] if forced else GEMINI_MODELS
+    last_error = ""
 
-# --------------------------------------------------------------------------- #
-# 6. Procenta shody – počítá backend z reálných dat, ne AI
-# --------------------------------------------------------------------------- #
+    for model in models:
+        try:
+            client = genai.Client(
+                api_key=api_key, http_options=types.HttpOptions(timeout=15000)
+            )
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    temperature=0,
+                    top_p=0,
+                    top_k=1,
+                    seed=7,
+                    response_mime_type="application/json",
+                    system_instruction=SYSTEM_PROMPT,
+                ),
+            )
+            text = (response.text or "").strip()
+            if text.startswith("```"):
+                text = text.strip("`")
+                text = text[text.find("{") :]
+            data = json.loads(text)
+            if isinstance(data, dict):
+                _LAST_AI[prompt] = data
+                while len(_LAST_AI) > _LAST_AI_LIMIT:
+                    _LAST_AI.pop(next(iter(_LAST_AI)))
+                return data
+        except Exception as exc:  # pragma: no cover
+            last_error = str(exc)[:160]
+            logger.info("Model %s neodpověděl: %s", model, last_error)
+            continue
 
-def _similarity(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, float]:
-    """Tři dílčí čísla pro štítky v UI (styl / fyzično / statistiky)."""
-    # styl: archetyp (35), pozice (18), odkud skóruje (18), trojky (12),
-    # tvorba (9), objem hry (6), efektivita (6), šestky (6)
-    style = 30.0 if a["archetype"] == b["archetype"] else 0.0
-    style += 0.12 * position_score(a, b)
-    # Pod košem, nebo za trojkou – tohle je hlavní rozdíl mezi Giannisem
-    # (91 % střel za dva) a Durantem (73 %), i když mají stejné body.
-    # Hlavní věc: odkud hráč skóruje. Kolik bodů jde z trojek, z šestek
-    # a z blízkosti koše – z toho se pozná střelec od hráče, který žije
-    # z nájezdů. Váží nejvíc, protože o stylu rozhoduje nejvíc.
-    style += _clamp(22.0 - abs(a.get("three_pts_share", 0) - b.get("three_pts_share", 0)) * 55.0)
-    style += _clamp(10.0 - abs(a.get("ft_pts_share", 0) - b.get("ft_pts_share", 0)) * 60.0)
-    style += _clamp(10.0 - abs(a.get("two_rate", 0) - b.get("two_rate", 0)) * 22.0)
-    style += _clamp(8.0 - abs(a["three_rate"] - b["three_rate"]) * 12.0)
-    style += _clamp(9.0 - abs(a["ast"] - b["ast"]) * 2.0)
-    style += _clamp(7.0 - abs(a.get("creator", 0) - b.get("creator", 0)) * 20.0)
-    style += _clamp(7.0 - abs(a.get("rebounder", 0) - b.get("rebounder", 0)) * 22.0)
-    style += _clamp(5.0 - abs(a.get("volume", 0) - b.get("volume", 0)) * 18.0)
-    style += _clamp(4.0 - abs(a["usage"] - b["usage"]) * 30.0)
-    style += _clamp(3.0 - abs(a["ts"] - b["ts"]) * 60.0)
-    style += _clamp(4.0 - abs(a["fta"] - b["fta"]) * 1.2)
-    # Střelec a slasher nejsou stejný hráč, i když mají stejnou pozici
-    if a.get("scoring_mode") != b.get("scoring_mode"):
-        style -= 18.0
-    # Jiná pozice je vždy srážka – křídelní pivot není křídlo
-    if a["position_type"] != b["position_type"]:
-        style -= 12.0
-    # Obrana: elitní obránce (DPOY, All-Defensive) nikdy nedostane slabého
-    style -= defense.defense_penalty(a.get("defense_tier", "average"), b.get("defense_tier", "average"))
-    # Střelecký profil: elitní trojkař se nespojuje s hráčem bez trojky
-    g_gap = abs(a.get("gravity", 1) - b.get("gravity", 1))
-    style -= {0: 0.0, 1: 4.0, 2: 14.0}.get(g_gap, 24.0)
-    # Stejná pozice a stejný archetyp = plná shoda ve stylu, ale jen když
-    # se shoduje i to, odkud hráč skóruje.
-    if (
-        a["archetype"] == b["archetype"]
-        and a["position_type"] == b["position_type"]
-        and abs(a.get("three_pts_share", 0) - b.get("three_pts_share", 0)) <= 0.06
-        and abs(a.get("two_rate", 0) - b.get("two_rate", 0)) <= 0.18
-    ):
-        style = max(style, 95.0)
-
-    # fyzično: výška, váha a typ postavy (křídlo vs. podkošový hráč se pozná)
-    h = _clamp(100.0 - abs(a["height_cm"] - b["height_cm"]) * 6.0)
-    w = _clamp(100.0 - abs(a["weight_kg"] - b["weight_kg"]) * 5.0)
-    build_a = a["weight_kg"] / max(a["height_cm"], 1.0)
-    build_b = b["weight_kg"] / max(b["height_cm"], 1.0)
-    build = _clamp(100.0 - abs(build_a - build_b) * 900.0)
-    physical = 0.58 * h + 0.10 * w + 0.32 * build
-    # Typ postavy a atletičnost (explozivní atlet vs. dlouhý střelec vs.
-    # technický hráč): stejná výška nestačí, když se hráči jinak pohybují.
-    if a.get("build_type") != b.get("build_type"):
-        physical -= 9.0
-    physical -= min(abs(a.get("athletic_score", 0.5) - b.get("athletic_score", 0.5)) * 40.0, 14.0)
-    physical = _clamp(physical)
-
-    # statistiky: body, doskoky, efektivita, usage
-    # Na 100 držení (tempo éry), když jsou k dispozici; jinak základní průměry.
-    if a.get("pts100") is not None and b.get("pts100") is not None:
-        pts = _clamp(100.0 - abs(a["pts100"] - b["pts100"]) * 3.0)
-        reb_a, reb_b = (a.get("reb100") or a["reb"]), (b.get("reb100") or b["reb"])
-        reb = _clamp(100.0 - abs(reb_a - reb_b) * 5.0)
-    else:
-        pts = _clamp(100.0 - abs(a["pts"] - b["pts"]) * 4.0)
-        reb = _clamp(100.0 - abs(a["reb"] - b["reb"]) * 7.0)
-    ts = _clamp(100.0 - abs(a["ts"] - b["ts"]) * 220.0)
-    usage = _clamp(100.0 - abs(a["usage"] - b["usage"]) * 160.0)
-    # Statistiky: hlavně zdroj skórování, ne kolik bodů – dva hráči, kteří
-    # skórují stejně, jsou si blízcí i s jiným průměrem bodů.
-    scoring = 0.55 * (
-        100.0
-        - abs(a.get("three_pts_share", 0) - b.get("three_pts_share", 0)) * 200.0
-        - abs(a.get("ft_pts_share", 0) - b.get("ft_pts_share", 0)) * 120.0
+    cached = _LAST_AI.get(prompt)
+    if cached:
+        logger.info("AI neodpověděla (%s), používá se poslední odpověď", last_error)
+        return cached
+    logger.warning(
+        "AI výběr nejbližšího hráče selhal (použije se předvýběr): %s", last_error
     )
-    scoring = _clamp(scoring)
-    stats = 0.55 * scoring + 0.2 * pts + 0.15 * reb + 0.1 * usage
-    # Ocenění (MVP, All-NBA, All-Defensive, DPOY): podobný dopad = podobná čísla
-    aw_a = sum((a.get("award_detail") or {}).values())
-    aw_b = sum((b.get("award_detail") or {}).values())
-    stats = _clamp(stats - min(abs(aw_a - aw_b) * 1.2, 10.0))
-
-    # Styl a fyzično rozhodují o tom, kdo je „nejbližší hráč"; statistiky
-    # (vrchol na 100 držení a ocenění) jsou kontrola, proto váží méně.
-    total = 0.62 * style + 0.22 * physical + 0.16 * stats
-    # Kategorie dopadu: superstar (35 b) a hráč na 21 bodů nejsou „stejní".
-    # Rozdíl v objemu bodů se počítá podílem, ne rozdílem.
-    if a.get("pts") and b.get("pts"):
-        ratio = min(a["pts"], b["pts"]) / max(a["pts"], b["pts"])
-        if ratio < 0.85:
-            total -= (0.85 - ratio) * 90.0
-    # Elitní obránce (DPOY) a slabý obránce nejsou „nejbližší hráči",
-    # ani když sedí čísla i postava – srážka se propíše do celkového čísla.
-    tier_penalty = defense.defense_penalty(
-        a.get("defense_tier", "average"), b.get("defense_tier", "average")
-    )
-    if tier_penalty:
-        total -= tier_penalty * 0.6
-    # Strop: stejný styl nestačí na 99 %, když se hráči liší postavou.
-    # Dřív tu byl strop 70 + 0,28 × fyzično, který shodil i dvojice se
-    # shodou 95 % ve stylu (Jordan–Kobe na 68,7 %).
-    if physical < 95.0:
-        total = min(total, 78.0 + physical * 0.21)
-    return {
-        "match_pct": round(min(99.0, _clamp(total)), 1),
-        "style_pct": round(min(99.0, _clamp(style)), 1),
-        "physical_pct": round(_clamp(physical), 1),
-        "stats_pct": round(_clamp(stats), 1),
-    }
-
-
-# --------------------------------------------------------------------------- #
-# 7. Texty bez AI – aby karta nebyla nikdy prázdná
-# --------------------------------------------------------------------------- #
-
-def _fallback_texts(target: Dict[str, Any], cand: Dict[str, Any]) -> Dict[str, str]:
-    same = target["role_group"] == cand["role_group"]
-    style = (
-        f"Oba patří mezi {cand['role_label']}, "
-        + ("takže řeší stejné situace na hřišti. " if same else "byť každý s jiným těžištěm hry. ")
-        + f"Střelba: {target.get('gravity_label', '?')} vs {cand.get('gravity_label', '?')}. "
-        + f"Obrana: {target.get('defense_label', '?')} vs {cand.get('defense_label', '?')}."
-    )
-    physical = (
-        f"{target['height_cm']:.0f} vs {cand['height_cm']:.0f} cm, "
-        f"{target['weight_kg']:.0f} vs {cand['weight_kg']:.0f} kg. "
-        f"Typ postavy: {target.get('build_label', '?')} vs {cand.get('build_label', '?')}."
-    )
-    stats = (
-        f"Vrchol kariéry na 100 držení: {_fmt(target.get('pts100'))}/{_fmt(target.get('reb100'))}/"
-        f"{_fmt(target.get('ast100'))} vs {_fmt(cand.get('pts100'))}/{_fmt(cand.get('reb100'))}/"
-        f"{_fmt(cand.get('ast100'))}; TS {target['ts'] * 100:.1f} % vs {cand['ts'] * 100:.1f} %. "
-        f"Ocenění: {_award_text(target)} vs {_award_text(cand)}."
-    )
-    return {
-        "style_comparison": style,
-        "physical_comparison": physical,
-        "stats_comparison": stats,
-    }
-
-
-def _fallback_reasoning(target: Dict[str, Any]) -> str:
-    return (
-        f"{target['name']} je {target['role_label']} na úrovni "
-        f"{target['tier_label']}, proto se shoda hledá ve stejné roli "
-        f"a stejné kategorii dopadu."
-    )
-
-
-# --------------------------------------------------------------------------- #
-# 8. Hlavní funkce
-# --------------------------------------------------------------------------- #
-
-SUGGEST_PROMPT = """Jsi NBA analytik. Navrhni 5 hráčů NBA (jakékoli éry, ne zadaného hráče),
-kteří mají nejbližší herní styl k zadanému hráči v jeho vrcholu.
-Posuzuj: herní styl a roli, ATLETIČNOST a typ postavy (explozivní atlet /
-dlouhý hubený střelec / technický neexplozivní hráč), STŘELECKÝ profil
-(elitní trojkař vs. bez spolehlivé trojky), OBRANNOU úroveň (elitní obránce
-nikdy se slabým) a éru. Vrať POUZE JSON: {"candidates": ["Jméno 1", ... 5 jmen]}"""
+    return None
 
 
 def ai_suggest(target: Dict[str, Any]) -> List[str]:
