@@ -930,6 +930,21 @@ def _one_line(p: Dict[str, Any]) -> str:
     )
 
 
+def _fallback_why(target: Dict[str, Any], cand: Dict[str, Any]) -> str:
+    """Krátký důvod kandidáta z čísel – když AI nic nenapíše."""
+    bits: List[str] = []
+    if cand.get("archetype") == target.get("archetype"):
+        bits.append("stejný archetyp")
+    gap = _num(target.get("pts")) - _num(cand.get("pts"))
+    if abs(gap) <= 2.5:
+        bits.append(f"stejný objem bodů ({_num(cand.get('pts')):.1f} na zápas)")
+    if abs(_num(target.get("height_cm")) - _num(cand.get("height_cm"))) <= 5:
+        bits.append("podobná postava")
+    sim = _similarity(target, cand)["match_pct"]
+    bits.append(f"shoda {sim:.0f} %")
+    return ", ".join(bits)
+
+
 def _fallback_texts(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, str]:
     """Popisky trojice sloupců bez AI – vždy musí něco vrátit."""
     same_arch = a.get("archetype") == b.get("archetype")
@@ -1646,8 +1661,14 @@ def resolve(
         if (ai.get("reasoning") or "").strip():
             reasoning = ai["reasoning"].strip()
 
+    # Každý kandidát musí mít důvod, proč tam je – bez něj UI vypadá, že
+    # se nic nenačetlo. Když ho AI nedodala, odvodí se z čísel.
     if not top_three:
         top_three = [{"id": c["id"], "name": c["name"], "why": ""} for c in candidates[:3]]
+    top_three = [
+        dict(c, why=(c.get("why") or "").strip() or _fallback_why(target, c))
+        for c in top_three
+    ]
 
     return {
         "engine_version": ENGINE_VERSION,
