@@ -147,15 +147,21 @@ def defense_tier(
     na 100 držení podle tempa éry.
     """
     aw = awards or {}
-    if aw.get("dpoy", 0) >= 1 or aw.get("all_def", 0) >= 3:
+    # Ocenění se počítají, jen když nějaké opravdu jsou. Když se seznam
+    # ocenění nepodařilo načíst (nebo hráč žádné nemá), rozhodují čísla –
+    # jinak by každý vyšel jako „průměrný obránce".
+    has_awards = any(aw.values())
+    if has_awards and (aw.get("dpoy", 0) >= 1 or aw.get("all_def", 0) >= 3):
         return "elite"
-    has_def_award = aw.get("all_def", 0) >= 1
+    has_def_award = has_awards and aw.get("all_def", 0) >= 1
 
     stl100 = per100(stl, minutes, season) if minutes else _num(stl)
     blk100 = per100(blk, minutes, season) if minutes else _num(blk)
     if stl is None and blk is None:
         # starší éra bez STL/BLK – rozhodují jen ocenění
-        return "elite" if aw.get("all_def", 0) >= 2 else "average"
+        if has_awards and aw.get("all_def", 0) >= 2:
+            return "elite"
+        return "average"
 
     stocks = (stl or 0.0) + (blk or 0.0)
     big = role_group == "big"
