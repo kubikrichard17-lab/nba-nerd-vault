@@ -267,7 +267,11 @@ def shooting_gravity(fg3m: float, fg3a: float, fg3_pct: float) -> int:
     Rozhoduje objem střelby, ne procento: 0,9 trojky na zápas znamená, že
     trojka není hráčova zbraň (Jordan, DeRozan), i když ji občas trefí.
     """
-    if fg3a < 2.0 or fg3_pct < 0.27:
+    # Jordan v roce 1987 házel 0,8 trojky na zápas – trojka není jeho
+    # zbraň. Hráč, který hází aspoň jednu a půl trojky na zápas, ale
+    # nějakou má (Kobe 1996-97: 1,9 pokusu) – ten se nesmí počítat jako
+    # hráč bez trojky.
+    if fg3a < 0.8 or fg3_pct < 0.27:
         return 0
     if fg3m >= 2.3 and fg3_pct >= 0.375:
         return 3
