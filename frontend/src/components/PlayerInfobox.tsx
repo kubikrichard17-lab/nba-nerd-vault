@@ -1,6 +1,7 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
+import { API } from '@/lib/api';
 import { PlayerProfile } from '@/types';
 import { Trophy, Award, Globe, GraduationCap, Calendar, ShieldCheck, User } from 'lucide-react';
 
@@ -9,18 +10,45 @@ interface PlayerInfoboxProps {
 }
 
 export const PlayerInfobox: React.FC<PlayerInfoboxProps> = ({ player }) => {
+  // Vždy oficiální NBA CDN s přesným ID. Když tam fotka není (starší legendy),
+  // backend najde ověřenou fotku na Basketball-Reference, jinak se ukážou iniciály.
   const [imgSrc, setImgSrc] = useState(
-    player.headshot_url || `https://cdn.nba.com/headshots/nba/latest/1040x760/${player.id}.png`
+    `https://cdn.nba.com/headshots/nba/latest/1040x760/${player.id}.png`
   );
   const [imgError, setImgError] = useState(false);
+  const [triedFallback, setTriedFallback] = useState(false);
 
-  // Fallback image handling
-  const handleImageError = () => {
-    if (!imgError) {
+  useEffect(() => {
+    setImgSrc(`https://cdn.nba.com/headshots/nba/latest/1040x760/${player.id}.png`);
+    setImgError(false);
+    setTriedFallback(false);
+  }, [player.id]);
+
+  const initials = (player.full_name || '?')
+    .split(' ')
+    .filter(Boolean)
+    .map((w) => w[0])
+    .slice(0, 2)
+    .join('')
+    .toUpperCase();
+
+  const handleImageError = async () => {
+    if (triedFallback) {
       setImgError(true);
-      // Fallback SVG or avatar
-      setImgSrc(`https://ak-static.cms.nba.com/wp-content/uploads/headshots/nba/latest/260x190/${player.id}.png`);
+      return;
     }
+    setTriedFallback(true);
+    try {
+      const res = await fetch(`${API}/api/players/${player.id}/headshot`);
+      const data = await res.json();
+      if (data?.url && data.source !== 'nba') {
+        setImgSrc(data.url);
+        return;
+      }
+    } catch {
+      /* iniciály */
+    }
+    setImgError(true);
   };
 
   return (
@@ -54,12 +82,13 @@ export const PlayerInfobox: React.FC<PlayerInfoboxProps> = ({ player }) => {
               src={imgSrc}
               alt={player.full_name}
               onError={handleImageError}
+              referrerPolicy="no-referrer"
               className="w-full h-full object-cover object-top hover:scale-105 transition-transform duration-300"
             />
           ) : (
             <div className="flex flex-col items-center justify-center text-slate-500">
-              <User className="w-20 h-20 text-slate-600 mb-2" />
-              <span className="text-xs font-medium">Foto nedostupné</span>
+              <span className="text-5xl font-black text-slate-500 tracking-tight">{initials}</span>
+              <span className="text-xs font-medium mt-2">Foto nedostupné</span>
             </div>
           )}
         </div>
