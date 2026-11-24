@@ -763,7 +763,11 @@ def league_season_for_profile(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
         seen_seasons.add(season)
         rows = _league_season(season)
         if rows:
-            return rows
+            # Kandidáti ze sezónní tabulky + hráči, jejichž kariéru už
+            # aplikace zná (legendy mimo sezónní tabulku). Bez toho by
+            # Jordan dostal jen dnešní hráče a Karla Malona z ESPN.
+            known = {r["id"] for r in rows}
+            return rows + [r for r in _cached_players() if r["id"] not in known]
 
     # Záloha: hráči, jejichž kariérní profil už aplikace zná (bez sítě)
     return _cached_players()
@@ -1003,6 +1007,15 @@ def remember_position(player_id: int, position: str, height_cm: float, weight_kg
     )
 
 
+def remember_career(player_id: int, name: str, stat: Dict[str, Any]) -> None:
+    """Zapamatuje si kariérní profil hráče (dočasně, s vypršením)."""
+    if not stat or not stat.get("gp"):
+        return
+    value = dict(stat)
+    value["name"] = name or value.get("name") or ""
+    _cache_set(f"nba:{player_id}", value)
+
+
 def known_position(player_id: int) -> Optional[Dict[str, Any]]:
     """
     Pozice a míry hráče z paměti – bez čekání na síť.
@@ -1230,6 +1243,19 @@ def career_profile(player_id: Optional[int], name: str) -> Optional[Dict[str, An
         # Málo zápasů = NBA API nezná celou kariéru, vezme se Basketball-Reference
         if stats and stats.get("gp", 0) < 250:
             stats = None
+
+    # Když hráč není v sezónní tabulce ESPN (ukončil kariéru nebo je mimo
+    # prvních 200), použije se kariérní seznam z ESPN. Ten dává průměry
+    # na zápas, takže se hodí pro profil i pro dočasný seznam kandidátů.
+    if not stats and player_id and source_switch.espn_first():
+        try:
+            from . import espn_seasons
+
+            espn = espn_seasons.career_stats(player_id)
+            if espn and espn.get("gp", 0) >= 50:
+                stats = dict(espn)
+        except Exception as exc:  # pragma: no cover
+            logger.warning("ESPN kariéra %s selhala: %s", player_id, exc)
 
     # Na serveru NBA API neodpovídá – ESPN je pak nejrychlejší a nejspolehlivější
     if not stats and player_id:
