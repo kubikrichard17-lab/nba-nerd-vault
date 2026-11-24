@@ -118,6 +118,52 @@ def _find_player(name: str) -> Tuple[Optional[int], str]:
     return None, name
 
 
+def _season_rows_for(player_id: int) -> List[Dict[str, Any]]:
+    """
+    Sezóny hráče pro výpočet vrcholu. V cloudu (ESPN) se berou z ESPN,
+    lokálně z NBA API; když jeden zdroj nic nevrátí, zkusí se druhý.
+    """
+    rows: List[Dict[str, Any]] = []
+
+    try:
+        from services import source_switch
+
+        espn_first = source_switch.espn_first()
+    except Exception:  # pragma: no cover
+        espn_first = False
+
+    if espn_first:
+        try:
+            from services import espn_seasons
+
+            for r in espn_seasons.player_season_stats(player_id) or []:
+                if (r.get("gp") or 0) > 0:
+                    rows.append(dict(r))
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Sezóny %s z ESPN selhaly: %s", player_id, exc)
+
+    if not rows:
+        try:
+            from services import nba_fetcher
+
+            frame = nba_fetcher._career_frame(player_id)
+            for r in nba_fetcher._career_rows(frame) if frame is not None else []:
+                gp = int(r.get("GP") or 0)
+                if gp <= 0:
+                    continue
+                rows.append({
+                    "season_id": str(r.get("SEASON_ID")), "gp": gp,
+                    "pts": r.get("PTS"), "reb": r.get("REB"), "ast": r.get("AST"),
+                    "stl": r.get("STL"), "blk": r.get("BLK"), "tov": r.get("TOV"),
+                    "fgm": r.get("FGM"), "fga": r.get("FGA"), "fg3m": r.get("FG3M"),
+                    "fg3a": r.get("FG3A"), "ftm": r.get("FTM"), "fta": r.get("FTA"),
+                    "min_per_game": r.get("MIN"),
+                })
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Sezóny %s z NBA API selhaly: %s", player_id, exc)
+    return rows
+
+
 def _profile_by_name(name: str) -> Optional[Dict[str, Any]]:
     """
     Prime profil hráče stažený za běhu (jen pro navržené kandidáty).
@@ -128,24 +174,7 @@ def _profile_by_name(name: str) -> Optional[Dict[str, Any]]:
         if not pid:
             return None
 
-        from services import nba_fetcher
-
-        frame = nba_fetcher._career_frame(pid)
-        if frame is None or frame.empty:
-            return None
-        rows = []
-        for r in nba_fetcher._career_rows(frame):
-            gp = int(r.get("GP") or 0)
-            if gp <= 0:
-                continue
-            rows.append({
-                "season_id": str(r.get("SEASON_ID")), "gp": gp,
-                "pts": r.get("PTS"), "reb": r.get("REB"), "ast": r.get("AST"),
-                "stl": r.get("STL"), "blk": r.get("BLK"), "tov": r.get("TOV"),
-                "fgm": r.get("FGM"), "fga": r.get("FGA"), "fg3m": r.get("FG3M"),
-                "fg3a": r.get("FG3A"), "ftm": r.get("FTM"), "fta": r.get("FTA"),
-                "min_per_game": r.get("MIN"),
-            })
+        rows = _season_rows_for(pid)
         if not rows:
             return None
         size = nba_external.position_and_size(pid, full) or {}
