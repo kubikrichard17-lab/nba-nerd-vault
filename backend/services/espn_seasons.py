@@ -175,6 +175,12 @@ def _plain(text: Any) -> str:
     return re.sub(r"[^a-z]", "", t.lower())
 
 
+def _is_espn_id(value: int) -> bool:
+    """Pozná číslo, které už je ESPN ID (profil v ESPN existuje)."""
+    payload = _get_json(f"{ESPN_BASE}/athletes/{int(value)}") or {}
+    return bool(payload.get("fullName"))
+
+
 def resolve_id(nba_id: int) -> int:
     """
     Přeloží NBA ID hráče na ID v ESPN (jsou jiná: LeBron 2544 → 1966).
@@ -183,6 +189,10 @@ def resolve_id(nba_id: int) -> int:
     bere se jen přesná shoda jména v NBA. Když se nenajde, vrátí původní ID.
     """
     def _do() -> int:
+        # Už je to ESPN ID? (Jordan 1035, Kobe 110) – pak se nepřekládá.
+        if _is_espn_id(int(nba_id)):
+            return int(nba_id)
+
         name = None
         try:
             from nba_api.stats.static import players
@@ -192,8 +202,18 @@ def resolve_id(nba_id: int) -> int:
                     name = pl["full_name"]
                     break
         except Exception:
-            return int(nba_id)
+            name = None
         if not name:
+            # Registr NBA je v cloudu nedostupný – jméno se vezme z paměti
+            # aplikace (profily hráčů, kariérní mezipaměť), jinak by se
+            # ID nepřeložilo a statistiky by se hledaly pod špatným číslem.
+            try:
+                from services import nba_external
+
+                name = nba_external._name_for(int(nba_id))
+            except Exception:
+                name = None
+        if not name or str(name).isdigit():
             return int(nba_id)
         from urllib.parse import quote
 
@@ -213,6 +233,49 @@ def resolve_id(nba_id: int) -> int:
         return int(nba_id)
 
     return _cached(f"resolve:{nba_id}", _do)
+
+
+def search_athlete(name: str) -> Optional[int]:
+    """
+    Najde hráče podle jména přímo v ESPN (bez registru NBA).
+
+    Na serveru je registr NBA nedostupný, takže bez tohohle by se legendy
+    jako Kobe, Wade nebo Pippen vůbec nedohledaly a AI by navrhovala
+    náhodné současné hráče.
+    """
+    wanted = _plain(name)
+    if not wanted:
+        return None
+
+    def _do() -> Optional[int]:
+        from urllib.parse import quote
+
+        data = _get_json(
+            "https://site.web.api.espn.com/apis/search/v2?limit=20&type=player&query="
+            + quote(name)
+        )
+        # Ve výsledcích je víc sportovců stejného jména (Michael Jordan
+        # z NCAAF, MMA…). Bere se první NBA, u kterého profil potvrdí
+        # odehranou kariéru – jinak se hráč plete s jiným sportem.
+        for res in (data or {}).get("results") or []:
+            for item in res.get("contents") or []:
+                if item.get("type") != "player" or str(item.get("description")) != "NBA":
+                    continue
+                if _plain(item.get("displayName", "")) != wanted:
+                    continue
+                m = re.search(r"a:(\d+)", str(item.get("uid", "")))
+                if not m:
+                    continue
+                espn_id = int(m.group(1))
+                payload = _get_json(f"{ESPN_BASE}/athletes/{espn_id}") or {}
+                if payload.get("fullName") and _plain(payload["fullName"]) != wanted:
+                    continue
+                if not (payload.get("statisticslog") or payload.get("statistics")):
+                    continue
+                return espn_id
+        return None
+
+    return _cached(f"search:{wanted}", _do)
 
 
 def player_season_stats(player_id: int) -> Optional[List[Dict[str, Any]]]:
