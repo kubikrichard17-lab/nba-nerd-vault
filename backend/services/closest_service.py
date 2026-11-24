@@ -180,9 +180,22 @@ def _suggested(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
 def _resolve_for(profile: Dict[str, Any], pool: List[Dict[str, Any]], label: str) -> Optional[Dict[str, Any]]:
     """Jedno volání modelu pro danou verzi hráče."""
     suggested = _suggested(profile)
+    # Diagnostika pro log serveru – z kolika návrhů se opravdu počítalo.
+    logger.info(
+        "Nejbližší hráč (%s): AI navrhla %s",
+        label,
+        [c.get("name") for c in suggested] or "nic",
+    )
     result = None
     if len(suggested) >= 2:
         result = closest_player.resolve(profile, pool, suggested=suggested)
+        # AI smí navrhnout jen hráče, kteří mají co porovnávat. Když z pěti
+        # návrhů zbyl jediný (ostatní se nedohledali nebo byli vyloučeni
+        # tvrdým filtrem obrany), srovnává se raději podle předvýběru –
+        # jinak by Jordan skončil u jediného kandidáta s 40 % shody.
+        if result and len(result.get("top_3_candidates") or []) < 2:
+            logger.info("Nejbližší hráč (%s): z návrhů zbyl jediný kandidát, bere se předvýběr", label)
+            result = None
     if not result:
         result = closest_player.resolve(profile, pool)
     if result:
