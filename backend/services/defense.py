@@ -133,19 +133,26 @@ def _num(value: Any) -> Optional[float]:
 # --------------------------------------------------------------------------- #
 
 def defense_tier(
-    stl100: Optional[float],
-    blk100: Optional[float],
+    stl: Optional[float],
+    blk: Optional[float],
     role_group: str,
     awards: Optional[Dict[str, int]],
+    minutes: Optional[float] = None,
+    season: Optional[str] = None,
 ) -> str:
-    """Elitní / průměrný / slabý obránce. Ocenění mají přednost před čísly."""
+    """
+    Elitní / průměrný / slabý obránce. Ocenění mají přednost před čísly.
+
+    `stl` a `blk` jsou na zápas; když je zadané `minutes`, přepočítají se
+    na 100 držení podle tempa éry.
+    """
     aw = awards or {}
     if aw.get("dpoy", 0) >= 1 or aw.get("all_def", 0) >= 3:
         return "elite"
     has_def_award = aw.get("all_def", 0) >= 1
 
-    stl = _num(stl100)
-    blk = _num(blk100)
+    stl100 = per100(stl, minutes, season) if minutes else _num(stl)
+    blk100 = per100(blk, minutes, season) if minutes else _num(blk)
     if stl is None and blk is None:
         # starší éra bez STL/BLK – rozhodují jen ocenění
         return "elite" if aw.get("all_def", 0) >= 2 else "average"
@@ -217,7 +224,7 @@ def build_type(
         return "powerful"
     if athletic >= 0.66:
         return "explosive"
-    if bmi <= 0.52 and height_cm >= 198 and three_rate >= 0.18:
+    if bmi <= 0.545 and height_cm >= 201 and three_rate >= 0.22:
         return "long_lean"
     if athletic <= 0.52:
         return "technical"
@@ -248,8 +255,13 @@ GRAVITY_LABEL = {
 
 
 def shooting_gravity(fg3m: float, fg3a: float, fg3_pct: float) -> int:
-    """3 = elitní, 2 = spolehlivý, 1 = střední, 0 = bez spolehlivé trojky."""
-    if fg3a < 1.2 or fg3_pct < 0.27:
+    """
+    3 = elitní, 2 = spolehlivý, 1 = střední, 0 = bez spolehlivé trojky.
+
+    Rozhoduje objem střelby, ne procento: 0,9 trojky na zápas znamená, že
+    trojka není hráčova zbraň (Jordan, DeRozan), i když ji občas trefí.
+    """
+    if fg3a < 2.0 or fg3_pct < 0.27:
         return 0
     if fg3m >= 2.3 and fg3_pct >= 0.375:
         return 3
