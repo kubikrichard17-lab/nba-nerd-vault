@@ -211,6 +211,10 @@ def build_closest_payload(
     awards = len(player.awards or [])
 
     career_stat = dict(external) if external else {}
+    if external:
+        # Kariéra se pamatuje (dočasně) – slouží i jako kandidát pro
+        # ostatní hráče, takže legenda mimo sezónní tabulku nezmizí.
+        nba_external.remember_career(player.id, player.full_name, external)
     award_detail = closest_player.defense.award_profile(player.id)
     base = closest_player.build_profile(
         player_id=player.id,
