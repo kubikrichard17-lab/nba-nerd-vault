@@ -699,6 +699,18 @@ def related_arch(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
     return abs(_num(a.get("gravity"), 1) - _num(b.get("gravity"), 1)) < 2
 
 
+def three_share(p: Dict[str, Any]) -> float:
+    """Podíl bodů ze trojek (0–0,8). Počítá se i z profilu, kde chybí."""
+    value = p.get("three_pts_share")
+    if value is not None:
+        return _clamp(_num(value), 0.0, 0.8)
+    pts = _num(p.get("pts"))
+    fg3m = _num(p.get("fg3m"))
+    if pts <= 0:
+        return 0.0
+    return _clamp(3.0 * fg3m / pts, 0.0, 0.8)
+
+
 def _style_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     """Jak moc se hráči podobají stylem hry (archetyp, střelba, obrana)."""
     score = 0.0
@@ -735,8 +747,8 @@ def _style_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
         score += 3.0
 
     # podíl bodů z trojek
-    three_a = _num(a.get("three_pts_share"))
-    three_b = _num(b.get("three_pts_share"))
+    three_a = three_share(a)
+    three_b = three_share(b)
     score += max(0.0, 4.0 - abs(three_a - three_b) * 20.0)
 
     return _clamp(score)
@@ -789,6 +801,13 @@ def compare_pair(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     """
     sim = _similarity(a, b)
     style_note = _style_note(a, b)
+    if isinstance(a, dict) and isinstance(b, dict):
+        # Uživatel musí vidět stejná dílčí čísla na hlavní stránce
+        # i na stránce s porovnáváním.
+        a.setdefault("style_pct", sim["style_pct"])
+        b.setdefault("style_pct", sim["style_pct"])
+        a.setdefault("stylistic_pct", sim["style_pct"])
+        b.setdefault("stylistic_pct", sim["style_pct"])
     same_arch = a["archetype"] == b["archetype"]
     same_pos = a["position_type"] == b["position_type"]
     return {
@@ -804,6 +823,10 @@ def compare_pair(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
         "same_archetype": same_arch,
         "same_position": same_pos,
         "style_note": style_note,
+        # popisky, které ukazuje stránka s porovnáváním
+        "style_pct": sim["style_pct"],
+        "physical_pct": sim["physical_pct"],
+        "stats_pct": sim["stats_pct"],
         # Plné profily pro volajícího (tabulka, popisky) – ve výstupu API
         # se přeskakují, protože začínají podtržítkem.
         "_p1": a,
