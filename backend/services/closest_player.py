@@ -1032,9 +1032,23 @@ def _build_prompt(target: Dict[str, Any], candidates: List[Dict[str, Any]]) -> s
 # 5. Volání Gemini – temperature 0, seed, JSON
 # --------------------------------------------------------------------------- #
 
+def _gemini_key() -> Optional[str]:
+    """Klíč pro Gemini: z prostředí, jinak z nastavení aplikace."""
+    key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if key:
+        return key
+    try:
+        from settings import GEMINI_API_KEY as configured
+
+        return configured or None
+    except Exception:
+        return None
+
+
 def _call_gemini_json(prompt: str) -> Optional[Dict[str, Any]]:
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    api_key = _gemini_key()
     if not api_key:
+        logger.warning("AI výběr nejbližšího hráče: chybí GEMINI_API_KEY")
         return None
     try:
         from google import genai
@@ -1230,9 +1244,16 @@ nikdy se slabým) a éru. Vrať POUZE JSON: {"candidates": ["Jméno 1", ... 5 jm
 
 
 def ai_suggest(target: Dict[str, Any]) -> List[str]:
-    """Fáze 1: AI navrhne 4–5 jmen. Bez klíče nebo při chybě vrací []."""
-    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    """
+    Fáze 1: AI navrhne 4–5 jmen. Bez klíče nebo při chybě vrací [].
+
+    Klíč se bere z prostředí (GEMINI_API_KEY / GOOGLE_API_KEY) a z nastavení
+    aplikace (backend/settings.py) – na serveru se klíč vkládá do prostředí
+    přes proměnnou GEMINI_API_KEY.
+    """
+    api_key = _gemini_key()
     if not api_key:
+        logger.warning("AI návrh kandidátů: chybí GEMINI_API_KEY")
         return []
     try:
         from google import genai
