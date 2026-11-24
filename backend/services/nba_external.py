@@ -30,6 +30,8 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+from services import source_switch
+
 CACHE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "external_pool.json.gz")
 CACHE_VERSION = 1
 
@@ -767,6 +769,166 @@ def league_season_for_profile(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
     return _cached_players()
 
 
+_ESPN_STAT_KEYS = {
+    "gamesPlayed": "gp",
+    "minutes": "min_per_game",
+    "points": "pts",
+    "totalRebounds": "reb",
+    "assists": "ast",
+    "steals": "stl",
+    "blocks": "blk",
+    "turnovers": "tov",
+    "fieldGoalsMade": "fgm",
+    "fieldGoalsAttempted": "fga",
+    "threePointFieldGoalsMade": "fg3m",
+    "threePointFieldGoalsAttempted": "fg3a",
+    "freeThrowsMade": "ftm",
+    "freeThrowsAttempted": "fta",
+    "fieldGoalPct": "fg_pct",
+    "threePointFieldGoalPct": "fg3_pct",
+    "freeThrowPct": "ft_pct",
+}
+
+# Kolik hráčů ligy se z ESPN bere jako kandidáti (podle bodů na zápas).
+ESPN_LEAGUE_LIMIT = 200
+
+
+def _espn_season_start(season: str) -> int:
+    """'2025-26' → 2026 (rok, kterým sezóna končí – tak čísluje ESPN)."""
+    try:
+        return int(str(season)[:4]) + 1
+    except (TypeError, ValueError):
+        return 0
+
+
+def _espn_league_rows(season: str) -> List[Dict[str, Any]]:
+    """
+    Sezónní průměry hráčů ligy z ESPN – jeden dotaz na kategorii plus jeden
+    dotaz na hráče. Používá se, když NBA API není dostupné (cloud).
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    from services import espn_seasons
+
+    year = _espn_season_start(season)
+    if not year:
+        return []
+    base = (
+        "https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba/"
+        f"seasons/{year}/types/2/leaders"
+    )
+    data = espn_seasons._get_json(f"{base}?limit={ESPN_LEAGUE_LIMIT}")
+    if not data:
+        return []
+
+    refs: Dict[int, str] = {}
+    for category in data.get("categories") or []:
+        if category.get("name") != "pointsPerGame":
+            continue
+        for leader in category.get("leaders") or []:
+            athlete = str((leader.get("athlete") or {}).get("$ref") or "")
+            stats_ref = str((leader.get("statistics") or {}).get("$ref") or "")
+            digits = "".join(ch for ch in athlete.split("/athletes/")[-1] if ch.isdigit())
+            if digits and stats_ref:
+                refs[int(digits)] = stats_ref.replace("http://", "https://")
+
+    def fetch(item):
+        espn_id, ref = item
+        payload = espn_seasons._get_json(ref)
+        if not payload:
+            return None
+        athlete_ref = str((payload.get("athlete") or {}).get("$ref") or "")
+        athlete = espn_seasons._get_json(athlete_ref.replace("http://", "https://")) or {}
+        values: Dict[str, Any] = {}
+        for category in (payload.get("splits") or {}).get("categories") or []:
+            for stat in category.get("stats") or []:
+                key = _ESPN_STAT_KEYS.get(stat.get("name"))
+                if key:
+                    values[key] = _num(stat.get("value"))
+        games = values.get("gp") or 0.0
+        if not games:
+            return None
+        # Pozor: ESPN číslo hráče není NBA ID. Do `id` patří přeložené NBA
+        # ID, jinak vzniknou nesmyslná čísla (61 644,91) a aplikace nepozná
+        # hráče, kterého má v databázi.
+        row: Dict[str, Any] = {
+            "id": int(espn_id),
+            "espn_id": int(espn_id),
+            "name": athlete.get("displayName") or athlete.get("fullName") or "",
+        }
+        row.update(values)
+        size = _cache_get(f"size:{espn_id}", TTL_STATS) or {}
+        row["position"] = size.get("position") or ""
+        row["height_cm"] = size.get("height_cm") or 0.0
+        row["weight_kg"] = size.get("weight_kg") or 0.0
+        if not row["height_cm"]:
+            # Míry a pozice z profilu v ESPN (jeden dotaz na kandidáta)
+            height = _num(athlete.get("height"))
+            weight = _num(athlete.get("weight"))
+            pos = athlete.get("position") or {}
+            if isinstance(pos, dict):
+                row["position"] = pos.get("abbreviation") or pos.get("displayName") or ""
+            # ESPN posílá míry v palcích i ve stopách; 80 znamená 6-8 (203 cm),
+            # ne 80 palců. Hodnoty nad 7 jsou palce, menší stopy.
+            height_cm = height * 2.54 if height and height > 7 else height * 30.48
+            row["height_cm"] = round(height_cm, 1) if height_cm else 0.0
+            row["weight_kg"] = round(weight * 0.45359237, 1) if weight else 0.0
+            if row["height_cm"]:
+                remember_position(
+                    int(espn_id), row["position"], row["height_cm"], row["weight_kg"]
+                )
+        return row
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        rows = [r for r in executor.map(fetch, refs.items()) if r]
+    if not rows:
+        return []
+
+    # ESPN posílá sezónní SOUČTY, aplikace počítá s průměry na zápas.
+    pct_keys = {"fg_pct", "fg3_pct", "ft_pct"}
+    for row in rows:
+        games = row.pop("gp", 0.0) or 0.0
+        row["gp"] = games
+        if games > 0:
+            for key in list(row.keys()):
+                if key in pct_keys or key in ("gp", "name", "position", "height_cm", "weight_kg"):
+                    continue
+                value = row.get(key)
+                if isinstance(value, (int, float)):
+                    row[key] = round(value / games, 2)
+        for key in pct_keys:
+            if isinstance(row.get(key), (int, float)):
+                row[key] = row[key] / 100.0
+    rows.sort(key=lambda r: -(r.get("pts") or 0.0))
+    _link_nba_ids(rows)
+    return rows
+
+
+def _link_nba_ids(rows: List[Dict[str, Any]]) -> None:
+    """
+    Přeloží ESPN ID na NBA ID tam, kde hráče zná databáze nebo registr NBA.
+    Neznámý hráč si nechá ESPN číslo (jen dočasně, nic se neukládá).
+    """
+    try:
+        import models
+        from database import SessionLocal
+
+        session = SessionLocal()
+        try:
+            known = {p.full_name: p.id for p in session.query(models.Player).all()}
+        finally:
+            session.close()
+    except Exception:
+        known = {}
+    from services.espn_seasons import _plain
+
+    by_plain = {_plain(name): pid for name, pid in known.items()}
+    for row in rows:
+        nba_id = by_plain.get(_plain(row.get("name") or ""))
+        if nba_id:
+            row["id"] = int(nba_id)
+
+
 def _cached_players() -> List[Dict[str, Any]]:
     """Hráči z paměti, když se sezónní tabulka nenačte (výpadek NBA API)."""
     out: List[Dict[str, Any]] = []
@@ -858,6 +1020,35 @@ def position_and_size(player_id: int, name: str = "") -> Optional[Dict[str, Any]
     if value and value.get("height_cm"):
         return value
 
+    if source_switch.espn_first() and not (value and value.get("height_cm")):
+        # NBA API je v cloudu zablokované – pozice a míry z ESPN.
+        from services import espn_seasons
+
+        espn_id = espn_seasons.resolve_id(player_id)
+        payload = espn_seasons._get_json(
+            "https://sports.core.api.espn.com/v2/sports/basketball/leagues/nba/"
+            f"athletes/{espn_id}"
+        )
+        if payload:
+            height = _num(payload.get("height"))
+            weight = _num(payload.get("weight"))
+            position = ""
+            pos = payload.get("position") or {}
+            if isinstance(pos, dict):
+                position = pos.get("abbreviation") or pos.get("displayName") or ""
+            if height or weight:
+                remember_position(
+                    player_id,
+                    position,
+                    round(height * 2.54, 1) if height else 0.0,
+                    round(weight * 0.45359237, 1) if weight else 0.0,
+                )
+                return {
+                    "position": position,
+                    "height_cm": round(height * 2.54, 1) if height else 0.0,
+                    "weight_kg": round(weight * 0.45359237, 1) if weight else 0.0,
+                }
+
     size_key = f"size:{player_id}"
     stale = _load_memory()["entries"].pop(size_key, None)
     if stale:
@@ -915,6 +1106,15 @@ def _league_season(season: str) -> List[Dict[str, Any]]:
     cached = _cache_get(key, TTL_STATS)
     if cached is not None:
         return cached or []
+
+    if source_switch.espn_first():
+        rows = _espn_league_rows(season)
+        if rows:
+            _cache_set(key, rows)
+            return rows
+        # Když ESPN nic nevrátí, pokračuje se na záložní seznam hráčů –
+        # prázdný výsledek by se jinak uložil do paměti jako „nikdo".
+        return _cached_players()
 
     try:
         from nba_api.stats.endpoints import leaguedashplayerstats
