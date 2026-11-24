@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 from services import defense
 
 # Když se změní prompt nebo logika, zvyš číslo – stará cache se přestane používat.
-ENGINE_VERSION = 24
+ENGINE_VERSION = 25
 
 # Kolik kandidátů se AI pošle (víc = horší soustředění, méně = může chybět správný)
 CANDIDATE_LIMIT = 12
