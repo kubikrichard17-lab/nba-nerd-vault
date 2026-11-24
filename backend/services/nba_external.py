@@ -977,12 +977,26 @@ def _cached_players() -> List[Dict[str, Any]]:
 
 def _name_for(player_id: int) -> str:
     """
-    Jméno hráče podle ID: registr NBA, jinak paměť aplikace.
+    Jméno hráče podle ID: databáze, registr NBA, paměť aplikace.
 
-    V cloudu registr NBA nefunguje, takže se jméno bere z kariérních
-    profilů, které si aplikace už uložila – bez jména by se nedalo
-    přeložit ESPN ID a hráč by „zmizel".
+    V cloudu registr NBA nefunguje, takže se jméno bere z databáze a
+    kariérních profilů, které si aplikace už uložila – bez jména by se
+    nedalo přeložit ESPN ID a hráč by „zmizel".
     """
+    try:
+        import models
+        from database import SessionLocal
+
+        session = SessionLocal()
+        try:
+            row = session.query(models.Player).filter(models.Player.id == player_id).first()
+            if row is not None and row.full_name:
+                return str(row.full_name)
+        finally:
+            session.close()
+    except Exception:
+        pass
+
     try:
         from nba_api.stats.static import players as nba_players
 
