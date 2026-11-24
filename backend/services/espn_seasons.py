@@ -334,18 +334,30 @@ def player_season_stats(player_id: int) -> Optional[List[Dict[str, Any]]]:
     return _cached(f"seasons:{player_id}", load)
 
 
-def career_stats(player_id: int) -> Optional[Dict[str, Any]]:
+def career_stats(player_id: int, name: str = "") -> Optional[Dict[str, Any]]:
     """
     Kariérní průměry hráče podle ESPN (jeden dotaz).
 
     Používá se jako náhrada, když NBA API neodpovídá a Basketball-Reference
     nestačí. Vrací i pozici a míry, protože je má ve stejném dokumentu.
+    `name` slouží k ověření, že profil v ESPN opravdu patří tomuhle hráči.
     """
     player_id = resolve_id(player_id)
+    wanted = _plain(name)
 
     def load() -> Optional[Dict[str, Any]]:
         data = _get_json(f"{ESPN_BASE}/athletes/{player_id}")
         if not data:
+            return None
+        # Číslo NBA ID se v ESPN trefí i do jiného sportovce (Jordan 893 =
+        # Jameel Watkins). Bez jména by se hráči ukázala cizí čísla.
+        full = _plain(data.get("fullName") or data.get("displayName") or "")
+        if wanted and full != wanted:
+            logger.info(
+                "ESPN profil %s patří jinému hráči (%s) – přeskakuje se",
+                player_id,
+                full or "?",
+            )
             return None
 
         # kariérní statistiky jsou odkaz v `statistics`
