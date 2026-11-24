@@ -41,8 +41,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
+from services import defense
+
 # Když se změní prompt nebo logika, zvyš číslo – stará cache se přestane používat.
-ENGINE_VERSION = 6
+ENGINE_VERSION = 7
 
 # Kolik kandidátů se AI pošle (víc = horší soustředění, méně = může chybět správný)
 CANDIDATE_LIMIT = 12
@@ -458,6 +460,7 @@ def build_profile(
     weight_kg: Optional[float],
     stat: Dict[str, Any],
     awards_count: int = 0,
+    award_detail: Optional[Dict[str, int]] = None,
 ) -> Dict[str, Any]:
     pts = _num(stat.get("pts"))
     reb = _num(stat.get("reb"))
@@ -475,6 +478,13 @@ def build_profile(
     fg3_pct = _num(stat.get("fg3_pct"))
     ft_pct = _num(stat.get("ft_pct"))
     minutes = _num(stat.get("min_per_game"), 32.0) or 32.0
+    # Procenta chybí v průměru z více sezón – dopočítají se z počtů
+    if not fg3_pct and fg3a:
+        fg3_pct = fg3m / fg3a
+    if not fg_pct and fga > 1.0:
+        fg_pct = fgm / fga
+    if not ft_pct and fta:
+        ft_pct = ftm / fta
 
     three_rate = _clamp(fg3a / fga, 0.0, 1.0)
     usage = _clamp(((fga + 0.44 * fta + tov) * 48.0 / minutes) / 100.0, 0.08, 0.45)
@@ -525,6 +535,27 @@ def build_profile(
     if awards_count < 2 and pts >= 19.0:
         awards_count = 2
     tier = impact_tier(pts, awards_count)
+
+    # --- Per 100 držení (tempo éry), obrana, postava, střelecký profil ---
+    seasons_list = stat.get("seasons") if isinstance(stat.get("seasons"), list) else []
+    season_hint = (seasons_list[0] if seasons_list else None) or stat.get("season")
+    mins_raw = stat.get("min_per_game")
+    pts100 = defense.per100(stat.get("pts"), mins_raw, season_hint)
+    reb100 = defense.per100(stat.get("reb"), mins_raw, season_hint)
+    ast100 = defense.per100(stat.get("ast"), mins_raw, season_hint)
+    stl100 = defense.per100(stat.get("stl"), mins_raw, season_hint)
+    blk100 = defense.per100(stat.get("blk"), mins_raw, season_hint)
+    stocks100 = None if (stl100 is None and blk100 is None) else (stl100 or 0.0) + (blk100 or 0.0)
+    detail = dict(award_detail or defense.empty_awards())
+    d_tier = defense.defense_tier(stl100, blk100, group, detail)
+    ft_rate = _clamp(fta / max(fga, 1.0), 0.0, 1.0)
+    h_val = _num(height_cm, 198.0)
+    w_val = _num(weight_kg, 98.0)
+    b_type = defense.build_type(
+        h_val, w_val, ft_rate, shot_profile["two_rate"], stocks100, group, three_rate
+    )
+    ath_score = defense.athleticism_score(ft_rate, shot_profile["two_rate"], stocks100)
+    gravity = defense.shooting_gravity(fg3m, fg3a, fg3_pct)
     profile = {
         "role_group": group,
         "height_cm": _num(height_cm, 198.0),
@@ -597,7 +628,35 @@ def build_profile(
         "tier": tier,
         "tier_label": TIER_LABEL[tier],
         "awards": awards_count,
+        "award_detail": detail,
+        "pts100": pts100,
+        "reb100": reb100,
+        "ast100": ast100,
+        "stl100": stl100,
+        "blk100": blk100,
+        "defense_tier": d_tier,
+        "defense_label": defense.DEFENSE_LABEL[d_tier],
+        "build_type": b_type,
+        "build_label": defense.BUILD_LABEL[b_type],
+        "athletic_score": ath_score,
+        "gravity": gravity,
+        "gravity_label": defense.GRAVITY_LABEL[gravity],
+        "ft_rate": round(ft_rate, 3),
+        "seasons": seasons_list,
     }
+
+
+def apply_awards(profile: Dict[str, Any], detail: Dict[str, int]) -> Dict[str, Any]:
+    """Doplní ocenění (DPOY, All-Defensive…) a přepočte obrannou úroveň."""
+    profile["award_detail"] = dict(detail or defense.empty_awards())
+    profile["defense_tier"] = defense.defense_tier(
+        profile.get("stl100"), profile.get("blk100"), profile.get("role_group", ""), profile["award_detail"]
+    )
+    profile["defense_label"] = defense.DEFENSE_LABEL[profile["defense_tier"]]
+    total = sum(profile["award_detail"].values())
+    if total > profile.get("awards", 0):
+        profile["awards"] = total
+    return profile
 
 
 def compare_pair(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
@@ -664,8 +723,26 @@ def _one_line(p: Dict[str, Any]) -> str:
         f"{p['fg3m']:.1f} trojky na zápas | "
         f"FG {p['fg_pct'] * 100:.1f} %, 3P {p['fg3_pct'] * 100:.1f} %, "
         f"TS {p['ts'] * 100:.1f} % | Usage {p['usage']:.2f} | "
-        f"{p['archetype_label']}, {p['role_label']}, {p['tier_label']}"
+        f"{p['archetype_label']}, {p['role_label']}, {p['tier_label']} | "
+        f"obrana: {p.get('defense_label', '?')}, postava: {p.get('build_label', '?')}, "
+        f"střelba: {p.get('gravity_label', '?')} | "
+        f"na 100 držení {_fmt(p.get('pts100'))}/{_fmt(p.get('reb100'))}/{_fmt(p.get('ast100'))} "
+        f"(zisky {_fmt(p.get('stl100'))}, bloky {_fmt(p.get('blk100'))}) | "
+        f"ocenění: {_award_text(p)}"
     )
+
+
+def _fmt(value: Any) -> str:
+    return "-" if value is None else f"{float(value):.1f}"
+
+
+def _award_text(p: Dict[str, Any]) -> str:
+    aw = p.get("award_detail") or {}
+    parts = []
+    for key, label in (("mvp", "MVP"), ("dpoy", "DPOY"), ("all_nba", "All-NBA"), ("all_def", "All-Defensive")):
+        if aw.get(key):
+            parts.append(f"{aw[key]}× {label}")
+    return ", ".join(parts) or "žádná"
 
 
 # --------------------------------------------------------------------------- #
@@ -729,6 +806,9 @@ def preselect(
         return 5
 
     def priority(c: Dict[str, Any]) -> int:
+        # Tvrdý filtr obrany: elitní obránce nedostane slabého a naopak.
+        if {target.get("defense_tier"), c.get("defense_tier")} == {"elite", "weak"}:
+            return 18
         fam = family(c)
         pos_ok = same_pos(c)
         tier_ok = nearby_tier(c)
@@ -861,6 +941,18 @@ STRIKTNÍ PRAVIDLA:
    `closest_player_name`. Musí sedět jak herně, tak fyzicky.
 5. Všechny texty piš česky, úderně, bez frází, 1-2 věty na kategorii.
 
+7. OBRANA je tvrdé pravidlo. Elitní obránce (DPOY, opakovaně All-Defensive,
+   Ben Simmons, Kawhi Leonard) NIKDY nedostane podprůměrného obránce
+   (Magic Johnson, Luka Dončić), i když mají podobná útočná čísla.
+8. POSTAVA A ATLETIČNOST, ne jen výška a váha: explozivní atlet (raný
+   LeBron, Giannis, Wade) ≠ dlouhý hubený střelec (KD, T-Mac, Dirk) ≠
+   technický neexplozivní hráč (Bird, Jokić).
+9. STŘELECKÝ PROFIL: elitního trojkaře (KD) nespojuj s hráčem bez spolehlivé
+   trojky (Siakam). Mladý Jordan má blíž k explozivním slasherům se střední
+   střelbou (Wade) než k moderním volume trojkařům (Jaylen Brown).
+10. Čísla jsou na 100 držení (tempo éry) a doplněná oceněními – starší éry
+   se tak dají férově srovnat s dnešními.
+
 6. Pokud dostaneš navíc fázi kariéry („Raná kariéra" / „Pozdní kariéra"),
    posuzuj jen tu – hráč se v ní mohl chovat úplně jinak než ve vrcholu.
 
@@ -873,9 +965,9 @@ Vrať POUZE JSON v tomto tvaru:
     {"name": "Jméno 3", "why": "..."}
   ],
   "closest_player_name": "Jméno vybraného z top_3_candidates",
-  "style_comparison": "1-2 úderné věty o shodě v herním stylu a roli",
-  "physical_comparison": "1-2 věty o výšce, váze, stavbě těla a atletičnosti",
-  "stats_comparison": "1-2 věty o kariérních průměrech, efektivitě a dopadu"
+  "style_comparison": "1-2 věty: herní styl, role, střelecký profil A OBRANNÁ úroveň obou",
+  "physical_comparison": "1-2 věty: výška, váha, STAVBA TĚLA a typ ATLETIČNOSTI",
+  "stats_comparison": "1-2 věty: vrcholné sezóny (Prime) na 100 držení podle tempa éry a ocenění"
 }"""
 
 
@@ -907,9 +999,9 @@ def _call_gemini_json(prompt: str) -> Optional[Dict[str, Any]]:
         from google import genai
         from google.genai import types
 
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=15000))
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
             contents=prompt,
             config=types.GenerateContentConfig(
                 temperature=0,
@@ -963,6 +1055,11 @@ def _similarity(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, float]:
     # Jiná pozice je vždy srážka – křídelní pivot není křídlo
     if a["position_type"] != b["position_type"]:
         style -= 12.0
+    # Obrana: elitní obránce (DPOY, All-Defensive) nikdy nedostane slabého
+    style -= defense.defense_penalty(a.get("defense_tier", "average"), b.get("defense_tier", "average"))
+    # Střelecký profil: elitní trojkař se nespojuje s hráčem bez trojky
+    g_gap = abs(a.get("gravity", 1) - b.get("gravity", 1))
+    style -= {0: 0.0, 1: 4.0, 2: 14.0}.get(g_gap, 24.0)
     # Stejná pozice a stejný archetyp = plná shoda ve stylu, ale jen když
     # se shoduje i to, odkud hráč skóruje.
     if (
@@ -980,10 +1077,22 @@ def _similarity(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, float]:
     build_b = b["weight_kg"] / max(b["height_cm"], 1.0)
     build = _clamp(100.0 - abs(build_a - build_b) * 900.0)
     physical = 0.58 * h + 0.10 * w + 0.32 * build
+    # Typ postavy a atletičnost (explozivní atlet vs. dlouhý střelec vs.
+    # technický hráč): stejná výška nestačí, když se hráči jinak pohybují.
+    if a.get("build_type") != b.get("build_type"):
+        physical -= 9.0
+    physical -= min(abs(a.get("athletic_score", 0.5) - b.get("athletic_score", 0.5)) * 40.0, 14.0)
+    physical = _clamp(physical)
 
     # statistiky: body, doskoky, efektivita, usage
-    pts = _clamp(100.0 - abs(a["pts"] - b["pts"]) * 4.0)
-    reb = _clamp(100.0 - abs(a["reb"] - b["reb"]) * 7.0)
+    # Na 100 držení (tempo éry), když jsou k dispozici; jinak základní průměry.
+    if a.get("pts100") is not None and b.get("pts100") is not None:
+        pts = _clamp(100.0 - abs(a["pts100"] - b["pts100"]) * 3.0)
+        reb_a, reb_b = (a.get("reb100") or a["reb"]), (b.get("reb100") or b["reb"])
+        reb = _clamp(100.0 - abs(reb_a - reb_b) * 5.0)
+    else:
+        pts = _clamp(100.0 - abs(a["pts"] - b["pts"]) * 4.0)
+        reb = _clamp(100.0 - abs(a["reb"] - b["reb"]) * 7.0)
     ts = _clamp(100.0 - abs(a["ts"] - b["ts"]) * 220.0)
     usage = _clamp(100.0 - abs(a["usage"] - b["usage"]) * 160.0)
     # Statistiky: hlavně zdroj skórování, ne kolik bodů – dva hráči, kteří
@@ -995,6 +1104,10 @@ def _similarity(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, float]:
     )
     scoring = _clamp(scoring)
     stats = 0.55 * scoring + 0.2 * pts + 0.15 * reb + 0.1 * usage
+    # Ocenění (MVP, All-NBA, All-Defensive, DPOY): podobný dopad = podobná čísla
+    aw_a = sum((a.get("award_detail") or {}).values())
+    aw_b = sum((b.get("award_detail") or {}).values())
+    stats = _clamp(stats - min(abs(aw_a - aw_b) * 1.2, 10.0))
 
     # Styl a fyzično rozhodují o tom, kdo je „nejbližší hráč"; statistiky
     # jsou jen doplňková kontrola, proto váží nejméně.
@@ -1019,17 +1132,19 @@ def _fallback_texts(target: Dict[str, Any], cand: Dict[str, Any]) -> Dict[str, s
     style = (
         f"Oba patří mezi {cand['role_label']}, "
         + ("takže řeší stejné situace na hřišti. " if same else "byť každý s jiným těžištěm hry. ")
-        + f"Podíl trojek ze střel: {target['three_rate']:.2f} vs {cand['three_rate']:.2f}."
+        + f"Střelba: {target.get('gravity_label', '?')} vs {cand.get('gravity_label', '?')}. "
+        + f"Obrana: {target.get('defense_label', '?')} vs {cand.get('defense_label', '?')}."
     )
     physical = (
-        f"Výška {target['height_cm']:.0f} vs {cand['height_cm']:.0f} cm a váha "
-        f"{target['weight_kg']:.0f} vs {cand['weight_kg']:.0f} kg určují, jak si "
-        f"oba drží pozici a jak jsou silní v kontaktu."
+        f"{target['height_cm']:.0f} vs {cand['height_cm']:.0f} cm, "
+        f"{target['weight_kg']:.0f} vs {cand['weight_kg']:.0f} kg. "
+        f"Typ postavy: {target.get('build_label', '?')} vs {cand.get('build_label', '?')}."
     )
     stats = (
-        f"Kariérní průměry {target['pts']:.1f}/{target['reb']:.1f}/{target['ast']:.1f} "
-        f"vs {cand['pts']:.1f}/{cand['reb']:.1f}/{cand['ast']:.1f}, "
-        f"efektivita TS {target['ts'] * 100:.1f} % vs {cand['ts'] * 100:.1f} %."
+        f"Vrchol kariéry na 100 držení: {_fmt(target.get('pts100'))}/{_fmt(target.get('reb100'))}/"
+        f"{_fmt(target.get('ast100'))} vs {_fmt(cand.get('pts100'))}/{_fmt(cand.get('reb100'))}/"
+        f"{_fmt(cand.get('ast100'))}; TS {target['ts'] * 100:.1f} % vs {cand['ts'] * 100:.1f} %. "
+        f"Ocenění: {_award_text(target)} vs {_award_text(cand)}."
     )
     return {
         "style_comparison": style,
@@ -1050,17 +1165,92 @@ def _fallback_reasoning(target: Dict[str, Any]) -> str:
 # 8. Hlavní funkce
 # --------------------------------------------------------------------------- #
 
+SUGGEST_PROMPT = """Jsi NBA analytik. Navrhni 5 hráčů NBA (jakékoli éry, ne zadaného hráče),
+kteří mají nejbližší herní styl k zadanému hráči v jeho vrcholu.
+Posuzuj: herní styl a roli, ATLETIČNOST a typ postavy (explozivní atlet /
+dlouhý hubený střelec / technický neexplozivní hráč), STŘELECKÝ profil
+(elitní trojkař vs. bez spolehlivé trojky), OBRANNOU úroveň (elitní obránce
+nikdy se slabým) a éru. Vrať POUZE JSON: {"candidates": ["Jméno 1", ... 5 jmen]}"""
+
+
+def ai_suggest(target: Dict[str, Any]) -> List[str]:
+    """Fáze 1: AI navrhne 4–5 jmen. Bez klíče nebo při chybě vrací []."""
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return []
+    try:
+        from google import genai
+        from google.genai import types
+
+        client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=15000))
+        response = client.models.generate_content(
+            model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
+            contents="HRÁČ (vrchol kariéry):\n" + _one_line(target),
+            config=types.GenerateContentConfig(
+                temperature=0, top_p=0, top_k=1, seed=7,
+                response_mime_type="application/json",
+                system_instruction=SUGGEST_PROMPT,
+            ),
+        )
+        text = (response.text or "").strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            text = text[text.find("{"):]
+        names = json.loads(text).get("candidates") or []
+        return [str(n).strip() for n in names if str(n).strip()][:5]
+    except Exception as exc:  # pragma: no cover
+        logger.warning("AI návrh kandidátů selhal: %s", exc)
+        return []
+
+
+def enrich_awards(target: Dict[str, Any], candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Za běhu stáhne ocenění jen kandidátům (max ~12, paralelně, s dočasnou
+    pamětí) a znovu rozhodne o obranné úrovni. Pak platí tvrdý filtr:
+    elitní obránce nedostane slabého a naopak.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    ids = [c["id"] for c in candidates]
+    try:
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            details = list(pool.map(defense.award_profile, ids))
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Ocenění kandidátů se nenačetla: %s", exc)
+        return candidates
+    out: List[Dict[str, Any]] = []
+    for cand, detail in zip(candidates, details):
+        apply_awards(cand, detail)
+        if {target.get("defense_tier"), cand.get("defense_tier")} == {"elite", "weak"}:
+            continue
+        out.append(cand)
+    return out or candidates
+
+
 def resolve(
     target: Dict[str, Any],
     pool: List[Dict[str, Any]],
     use_ai: bool = True,
+    suggested: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Vybere nejbližšího hráče. AI rozhoduje o stylu, backend dodává čísla.
     Když AI není k dispozici, použije se první kandidát z předvýběru –
     výsledek je pak pořád stejný a čitelný.
     """
-    candidates = preselect(target, pool)
+    # Fáze 2 dvoufázového výběru: AI navrhla jména, backend jim za běhu
+    # stáhl data. Vítěze určuje matematika (nejvyšší reálná shoda), ne AI.
+    suggested_mode = bool(suggested)
+    if suggested_mode:
+        candidates = [
+            c for c in suggested
+            if c["id"] != target["id"] and _norm(c["name"]) != _norm(target["name"])
+        ]
+    else:
+        candidates = preselect(target, pool)
+    if not candidates:
+        return None
+    candidates = enrich_awards(target, candidates)
     if not candidates:
         return None
 
@@ -1088,6 +1278,12 @@ def resolve(
         picked = by_name.get(_norm((ai.get("closest_player_name") or "").strip()))
         # AI smí vybrat jen z kandidátů; když se netrefí, vezme se první z top 3
         chosen = picked or (by_name.get(_norm(top_three[0]["name"])) if top_three else None)
+
+    if suggested_mode:
+        # matematika přebíjí AI: vítěz = nejvyšší shoda mezi navrženými
+        ranked = sorted(candidates, key=lambda c: (-_similarity(target, c)["match_pct"], c["id"]))
+        chosen = ranked[0]
+        top_three = [{"id": c["id"], "name": c["name"], "why": ""} for c in ranked[:3]]
 
     if chosen is None:
         # Bez AI rozhoduje pořadí předvýběru: nejdřív se hledá mezi hráči,
@@ -1152,5 +1348,6 @@ def resolve(
             "statisticky_dopad": texts["stats_comparison"],
         },
         "ai_used": bool(ai),
+        "two_phase": suggested_mode,
         "generated_at": datetime.utcnow().isoformat(),
     }
