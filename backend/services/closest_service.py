@@ -80,9 +80,77 @@ def _decorate(result: Dict[str, Any], match, db) -> Dict[str, Any]:
     return result
 
 
+def _profile_by_name(name: str) -> Optional[Dict[str, Any]]:
+    """
+    Prime profil hráče stažený za běhu (jen pro navržené kandidáty).
+    Nic se neukládá do databáze; sezóny i ocenění jdou přes dočasnou paměť.
+    """
+    try:
+        from nba_api.stats.static import players as nba_players
+
+        found = nba_players.find_players_by_full_name(name)
+        exact = [p for p in found if p["full_name"].lower() == name.lower()] or found
+        if not exact:
+            return None
+        pid, full = int(exact[0]["id"]), exact[0]["full_name"]
+
+        from services import nba_fetcher
+
+        frame = nba_fetcher._career_frame(pid)
+        if frame is None or frame.empty:
+            return None
+        rows = []
+        for r in nba_fetcher._career_rows(frame):
+            gp = int(r.get("GP") or 0)
+            if gp <= 0:
+                continue
+            rows.append({
+                "season_id": str(r.get("SEASON_ID")), "gp": gp,
+                "pts": r.get("PTS"), "reb": r.get("REB"), "ast": r.get("AST"),
+                "stl": r.get("STL"), "blk": r.get("BLK"), "tov": r.get("TOV"),
+                "fgm": r.get("FGM"), "fga": r.get("FGA"), "fg3m": r.get("FG3M"),
+                "fg3a": r.get("FG3A"), "ftm": r.get("FTM"), "fta": r.get("FTA"),
+                "min_per_game": r.get("MIN"),
+            })
+        if not rows:
+            return None
+        size = nba_external.position_and_size(pid, full) or {}
+        from services.career_phases import prime_window, _blend
+
+        stat = _blend(prime_window(rows))
+        stat["fg_pct"] = (stat.get("fgm") or 0) / stat["fga"] if stat.get("fga") else 0.0
+        stat["fg3_pct"] = (stat.get("fg3m") or 0) / stat["fg3a"] if stat.get("fg3a") else 0.0
+        stat["ft_pct"] = (stat.get("ftm") or 0) / stat["fta"] if stat.get("fta") else 0.0
+        return closest_player.build_profile(
+            player_id=pid, name=full,
+            position=size.get("position"), height_cm=size.get("height_cm"),
+            weight_kg=size.get("weight_kg"), stat=stat,
+        )
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Kandidát %s se nenačetl: %s", name, exc)
+        return None
+
+
+def _suggested(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Fáze 1: AI navrhne jména, fáze 2: stáhnou se jen jejich data."""
+    names = closest_player.ai_suggest(profile)
+    if not names:
+        return []
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        found = list(ex.map(_profile_by_name, names))
+    return [p for p in found if p]
+
+
 def _resolve_for(profile: Dict[str, Any], pool: List[Dict[str, Any]], label: str) -> Optional[Dict[str, Any]]:
     """Jedno volání modelu pro danou verzi hráče."""
-    result = closest_player.resolve(profile, pool)
+    suggested = _suggested(profile)
+    result = None
+    if len(suggested) >= 2:
+        result = closest_player.resolve(profile, pool, suggested=suggested)
+    if not result:
+        result = closest_player.resolve(profile, pool)
     if result:
         result["basis"] = label
     return result
@@ -109,6 +177,7 @@ def build_closest_payload(
     awards = len(player.awards or [])
 
     career_stat = dict(external) if external else {}
+    award_detail = closest_player.defense.award_profile(player.id)
     base = closest_player.build_profile(
         player_id=player.id,
         name=player.full_name,
@@ -117,11 +186,12 @@ def build_closest_payload(
         weight_kg=weight_kg,
         stat=career_stat,
         awards_count=awards,
+        award_detail=award_detail,
     )
 
     phases = career_phases(season_rows(player), base, closest_player.build_profile)
     prime = phases.get("prime") or {}
-    prime_profile = prime.get("profile") or base
+    prime_profile = closest_player.apply_awards(prime.get("profile") or base, award_detail)
 
     # 1) Prime – výchozí srovnání
     result = _resolve_for(prime_profile, pool, "prime")
@@ -149,6 +219,7 @@ def build_closest_payload(
             phase_profile = phase.get("profile")
             if not phase_profile:
                 continue
+            closest_player.apply_awards(phase_profile, award_detail)
             resolved = _resolve_for(phase_profile, pool, phase["key"])
             if not resolved:
                 continue
