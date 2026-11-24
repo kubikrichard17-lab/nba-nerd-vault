@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 from services import defense
 
 # Když se změní prompt nebo logika, zvyš číslo – stará cache se přestane používat.
-ENGINE_VERSION = 20
+ENGINE_VERSION = 22
 
 # Kolik kandidátů se AI pošle (víc = horší soustředění, méně = může chybět správný)
 CANDIDATE_LIMIT = 12
@@ -684,6 +684,102 @@ def apply_awards(profile: Dict[str, Any], detail: Dict[str, int]) -> Dict[str, A
     return profile
 
 
+def related_arch(a: Dict[str, Any], b: Dict[str, Any]) -> bool:
+    """
+    Sousední archetypy: skórující SG a střelec bez míče mají k sobě blízko.
+
+    Sousední archetyp nestačí, když se jeden trefuje z dálky a druhý ne
+    (KD a Siakam) – pak to nejsou podobní hráči.
+    """
+    arch_a, arch_b = a.get("archetype"), b.get("archetype")
+    if not arch_a or not arch_b or arch_a == arch_b:
+        return False
+    if arch_b not in _RELATED_ARCHETYPES.get(arch_a, set()):
+        return False
+    return abs(_num(a.get("gravity"), 1) - _num(b.get("gravity"), 1)) < 2
+
+
+def _style_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    """Jak moc se hráči podobají stylem hry (archetyp, střelba, obrana)."""
+    score = 0.0
+    arch_a, arch_b = a.get("archetype"), b.get("archetype")
+    if arch_a and arch_a == arch_b:
+        score += 38.0
+    elif related_arch(a, b):
+        score += 24.0
+
+    # způsob střílení
+    mode_a, mode_b = a.get("scoring_mode"), b.get("scoring_mode")
+    if mode_a and mode_a == mode_b:
+        score += 20.0
+    elif mode_a and mode_b:
+        score += 8.0
+
+    # střelba z dálky – rozdíl 0 = plná shoda, rozdíl 3 (žádná vs elitní) = 0
+    grav_a = _num(a.get("gravity"))
+    grav_b = _num(b.get("gravity"))
+    score += max(0.0, 16.0 - abs(grav_a - grav_b) * 5.5)
+
+    # obrana
+    tier_a = a.get("defense_tier") or "average"
+    tier_b = b.get("defense_tier") or "average"
+    if tier_a == tier_b:
+        score += 14.0
+    elif defense.defense_penalty(tier_a, tier_b) <= 10.0:
+        score += 7.0
+
+    # typ postavy (explozivní / dlouhý a hubený / silový)
+    if a.get("build_type") and a.get("build_type") == b.get("build_type"):
+        score += 8.0
+    elif a.get("build_type") and b.get("build_type"):
+        score += 3.0
+
+    # podíl bodů z trojek
+    three_a = _num(a.get("three_pts_share"))
+    three_b = _num(b.get("three_pts_share"))
+    score += max(0.0, 4.0 - abs(three_a - three_b) * 20.0)
+
+    return _clamp(score)
+
+
+def _physical_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    """Výška, váha a atletičnost – jak moc jsou si hráči tělesně podobní."""
+    height_gap = abs(_num(a.get("height_cm"), 198.0) - _num(b.get("height_cm"), 198.0))
+    weight_gap = abs(_num(a.get("weight_kg"), 95.0) - _num(b.get("weight_kg"), 95.0))
+    ath_gap = abs(_num(a.get("athletic_score"), 0.6) - _num(b.get("athletic_score"), 0.6))
+
+    score = 100.0
+    score -= min(height_gap * 1.9, 45.0)
+    score -= min(weight_gap * 0.55, 30.0)
+    score -= min(ath_gap * 45.0, 25.0)
+    return _clamp(score)
+
+
+def _stats_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
+    """Statistický dopad: body, doskoky, asistence, obrana a efektivita."""
+    pairs = [
+        ("pts", 1.0),
+        ("reb", 2.2),
+        ("ast", 2.2),
+        ("stl", 12.0),
+        ("blk", 12.0),
+        ("ts", 100.0),
+    ]
+    diffs: List[float] = []
+    for key, weight in pairs:
+        va = _num(a.get(key))
+        vb = _num(b.get(key))
+        if va <= 0 and vb <= 0:
+            continue
+        base = max((va + vb) / 2.0, 0.35 if key not in ("pts", "reb", "ast") else 1.0)
+        diffs.append(min(abs(va - vb) / base, 1.0) * weight)
+
+    if not diffs:
+        return 50.0
+    penalty = sum(diffs) / sum(w for _, w in pairs[: len(diffs)]) if diffs else 0.0
+    return _clamp(100.0 - penalty * 100.0)
+
+
 def compare_pair(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     """
     Porovnání dvou hráčů stejnou logikou, jakou používá „nejbližší hráč".
@@ -754,6 +850,51 @@ def _one_line(p: Dict[str, Any]) -> str:
         f"na 100 držení {_fmt(p.get('pts100'))}/{_fmt(p.get('reb100'))}/{_fmt(p.get('ast100'))} "
         f"(zisky {_fmt(p.get('stl100'))}, bloky {_fmt(p.get('blk100'))}) | "
         f"ocenění: {_award_text(p)}"
+    )
+
+
+def _fallback_texts(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, str]:
+    """Popisky trojice sloupců bez AI – vždy musí něco vrátit."""
+    same_arch = a.get("archetype") == b.get("archetype")
+    if same_arch:
+        style = (
+            f"Oba patří mezi {a.get('role_label')}, takže řeší stejné situace na hřišti. "
+            f"Střelba: {a.get('gravity_label')} vs {b.get('gravity_label')}. "
+            f"Obrana: {a.get('defense_label')} vs {b.get('defense_label')}."
+        )
+    else:
+        style = (
+            f"Role se liší: {a.get('archetype_label')} vs {b.get('archetype_label')}. "
+            f"Střelba: {a.get('gravity_label')} vs {b.get('gravity_label')}. "
+            f"Obrana: {a.get('defense_label')} vs {b.get('defense_label')}."
+        )
+
+    physical = (
+        f"{_fmt(a.get('height_cm'))} vs {_fmt(b.get('height_cm'))} cm, "
+        f"{_fmt(a.get('weight_kg'))} vs {_fmt(b.get('weight_kg'))} kg. "
+        f"Typ postavy: {a.get('build_label')} vs {b.get('build_label')}."
+    )
+
+    stats = (
+        f"Vrchol kariéry na 100 držení: "
+        f"{_fmt(a.get('pts100'))}/{_fmt(a.get('reb100'))}/{_fmt(a.get('ast100'))} vs "
+        f"{_fmt(b.get('pts100'))}/{_fmt(b.get('reb100'))}/{_fmt(b.get('ast100'))}; "
+        f"TS {_fmt(_num(a.get('ts')) * 100.0)} % vs {_fmt(_num(b.get('ts')) * 100.0)} %. "
+        f"Ocenění: {_award_text(a)} vs {_award_text(b)}."
+    )
+
+    return {
+        "style_comparison": style,
+        "physical_comparison": physical,
+        "stats_comparison": stats,
+    }
+
+
+def _fallback_reasoning(p: Dict[str, Any]) -> str:
+    """Jedna věta, proč se hledá právě v této skupině hráčů."""
+    return (
+        f"{p.get('name')} je {p.get('role_label')} na úrovni {p.get('tier_label')}, "
+        "proto se shoda hledá ve stejné roli a stejné kategorii dopadu."
     )
 
 
@@ -958,6 +1099,17 @@ def preselect(
 # 4. System prompt – basketbalová logika, ne matematika
 # --------------------------------------------------------------------------- #
 
+SUGGEST_PROMPT = """Jsi zkušený NBA analytik, který zná historii ligy i současnost.
+
+Dostaneš popis jednoho hráče (jeho vrchol kariéry). Navrhni 5 jiných hráčů
+– z jakékoli éry – kteří se mu nejvíc podobají stylem hry, postavou a rolí.
+Nikdy nenavrhuj hráče samotného. Nesnaž se o originalitu, hledej opravdovou
+podobnost (stejná role, stejný způsob střílení, podobná obrana).
+
+Odpověz POUZE JSON:
+{"candidates": ["Jméno Příjmení", "…", "…", "…", "…"]}
+"""
+
 SYSTEM_PROMPT = """Jsi zkušený NBA analytik, který zná historii ligy i současnost.
 
 ÚKOL: Ke zadanému hráči najdi hráče, o kterém NBA experti a fanoušci reálně
@@ -1159,6 +1311,55 @@ def ai_suggest(target: Dict[str, Any]) -> List[str]:
         return []
 
 
+# --------------------------------------------------------------------------- #
+# 5b. Výpočet shody – jediné místo, kde vzniká procento
+# --------------------------------------------------------------------------- #
+
+def _similarity(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, float]:
+    """
+    Shoda dvou profilů: herní styl, fyzicko a statistiky.
+
+    Styly a fyzicko rozhodují, statistiky jsou kontrola (nesmí doporučit
+    hráče, který má úplně jiný objem hry). Vrací i dílčí procenta, která
+    vidí uživatel.
+    """
+    # Dílčí čísla se počítají přímo tady (ne přes compare_pair – ten volá
+    # tuhle funkci a vznikla by smyčka).
+    style_pct = _style_similarity(a, b)
+    physical_pct = _physical_similarity(a, b)
+    stats_pct = _stats_similarity(a, b)
+
+    total = 0.62 * style_pct + 0.22 * physical_pct + 0.16 * stats_pct
+
+    # Stejný styl, ale jiná postava (jiná výška/váha) nesmí vyjít na 99 %.
+    if physical_pct < 95.0:
+        total = min(total, 78.0 + physical_pct * 0.21)
+
+    # Objem hry: hráč s výrazně nižším počtem bodů není stejná kategorie.
+    pts_a = _num(a.get("pts"))
+    pts_b = _num(b.get("pts"))
+    if pts_a > 0 and pts_b > 0:
+        ratio = min(pts_a, pts_b) / max(pts_a, pts_b)
+        if ratio < 0.85:
+            total -= (0.85 - ratio) * 90.0
+
+    # Obranná úroveň: elitní obránce se nepodobá slabému, i když styl sedí.
+    try:
+        total -= defense.defense_penalty(
+            a.get("defense_tier") or "average", b.get("defense_tier") or "average"
+        )
+    except Exception:  # pragma: no cover
+        pass
+
+    total = _clamp(total)
+    return {
+        "match_pct": total,
+        "style_pct": style_pct,
+        "physical_pct": physical_pct,
+        "stats_pct": stats_pct,
+    }
+
+
 def enrich_awards(target: Dict[str, Any], candidates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """
     Za běhu stáhne ocenění jen kandidátům (max ~12, paralelně, s dočasnou
@@ -1242,6 +1443,11 @@ def resolve(
         best = max(candidates, key=lambda c: _similarity(target, c)["match_pct"])
         if _similarity(target, best)["match_pct"] - _similarity(target, chosen)["match_pct"] > 6.0:
             chosen = best
+
+    if suggested_mode and len(candidates) < 2:
+        # Z návrhů zbyl jediný kandidát – s jedním se nedá vybírat, takže
+        # se rozhodne podle celého seznamu (a ten jediný zůstane v nabídce).
+        return resolve(target, pool, use_ai=use_ai)
 
     if suggested_mode:
         # matematika přebíjí AI: vítěz = nejvyšší shoda mezi navrženými
