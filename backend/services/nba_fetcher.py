@@ -257,13 +257,28 @@ def get_static_players_list() -> List[Dict[str, Any]]:
 
 
 def canonical_name(player_id: int) -> Optional[str]:
-    """Jméno hráče podle NBA registru (None, když ho registr nezná)."""
+    """
+    Jméno hráče podle NBA registru (None, když ho registr nezná).
+
+    V cloudu registr NBA nefunguje, takže se jméno bere i z paměti
+    aplikace (kariérní profily) – jinak by se pod ID 893 nechalo cizí
+    jméno z ESPN a profil by ukazoval cizí čísla.
+    """
     try:
         from nba_api.stats.static import players
 
         for p in players.get_players():
             if int(p["id"]) == int(player_id):
                 return str(p["full_name"])
+    except Exception:  # pragma: no cover
+        pass
+
+    try:
+        from services import nba_external
+
+        remembered = nba_external._name_for(int(player_id))
+        if remembered and not str(remembered).isdigit():
+            return str(remembered)
     except Exception:  # pragma: no cover
         pass
     return None
