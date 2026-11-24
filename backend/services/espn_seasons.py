@@ -241,8 +241,14 @@ def player_season_stats(player_id: int) -> Optional[List[Dict[str, Any]]]:
                 if block.get("type") != "total":
                     continue
                 stat_ref = ((block.get("statistics") or {}).get("$ref")) or ""
+                # types/2 = základní část, types/3 = play-off. Play-off řádky
+                # (3–20 zápasů) by zkreslily tabulku i kariérní průměr.
                 if stat_ref:
-                    refs.append((season_id, stat_ref))
+                    # ESPN uvádí v logu často jen play-off odkaz → vždy se
+                    # sáhne na základní část (types/2) téže sezóny.
+                    stat_ref = re.sub(r"/types/\d+/", "/types/2/", stat_ref)
+                    if all(r[0] != season_id for r in refs):
+                        refs.append((season_id, stat_ref))
 
         if not refs:
             return None
