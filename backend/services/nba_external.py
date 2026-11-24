@@ -1692,7 +1692,7 @@ def career_profile(player_id: Optional[int], name: str) -> Optional[Dict[str, An
         try:
             from . import espn_seasons
 
-            espn = espn_seasons.career_stats(player_id)
+            espn = espn_seasons.career_stats(player_id, name)
             if espn and espn.get("gp", 0) >= 50:
                 stats = dict(espn)
         except Exception as exc:  # pragma: no cover
@@ -1703,7 +1703,7 @@ def career_profile(player_id: Optional[int], name: str) -> Optional[Dict[str, An
         try:
             from . import espn_seasons
 
-            espn = espn_seasons.career_stats(player_id)
+            espn = espn_seasons.career_stats(player_id, name)
             if espn and espn.get("gp", 0) >= 50:
                 stats = dict(espn)
         except Exception as exc:  # pragma: no cover
