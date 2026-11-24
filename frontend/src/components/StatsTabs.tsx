@@ -601,7 +601,21 @@ export const StatsTabs: React.FC<StatsTabsProps> = ({ player, onSelectPlayer }) 
                               : cat.key === 'physical'
                                 ? activeClosestData.breakdown?.fyzicko
                                 : activeClosestData.breakdown?.statisticky_dopad);
-                          if (!text) return null;
+                          if (!text) {
+                            return (
+                              <div
+                                key={cat.key}
+                                className="p-2.5 rounded-xl bg-slate-950/70 border border-slate-800"
+                              >
+                                <p className="text-[10px] font-bold uppercase tracking-wider text-amber-300/90 mb-1">
+                                  {cat.icon} {cat.label}
+                                </p>
+                                <p className="text-[11px] text-slate-500 italic">
+                                  Porovnání se právě dopočítává…
+                                </p>
+                              </div>
+                            );
+                          }
                           return (
                             <div
                               key={cat.key}
