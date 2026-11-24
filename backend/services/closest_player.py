@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 from services import defense
 
 # Když se změní prompt nebo logika, zvyš číslo – stará cache se přestane používat.
-ENGINE_VERSION = 17
+ENGINE_VERSION = 18
 
 # Kolik kandidátů se AI pošle (víc = horší soustředění, méně = může chybět správný)
 CANDIDATE_LIMIT = 12
@@ -475,9 +475,9 @@ def build_profile(
     blk = _num(stat.get("blk"))
     tov = _num(stat.get("tov"))
     fga = max(_num(stat.get("fga"), 1.0), 1.0)
-    # Kandidát z ESPN nemá v sezónní tabulce trojky. Kdyby se braly jako
-    # nula, vyšel by z něj „hráč bez střelby" – proto se odhadnou z objemu
-    # střelby a šestek, aby se nestřelec nepletl se střelcem.
+    # Když se trojky nedaly zjistit (kandidát z ESPN), odhadnou se z objemu
+    # střelby a šestek. Když ale zdroj uvádí nulu, je to skutečná nula –
+    # Jordan (1986-88) trojky skoro neházel a nesmí se z něj stát trojkař.
     if stat.get("fg3a") is None:
         stat = dict(stat)
         fta_guess = _num(stat.get("fta"), 0.0)
