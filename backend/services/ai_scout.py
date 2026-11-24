@@ -13,9 +13,10 @@ def _call_gemini(prompt: str) -> Optional[str]:
         return None
     try:
         from google import genai
-        client = genai.Client(api_key=GEMINI_API_KEY)
+        from google.genai import types as _t
+        client = genai.Client(api_key=GEMINI_API_KEY, http_options=_t.HttpOptions(timeout=15000))
         response = client.models.generate_content(
-            model="gemini-2.5-flash",
+            model=os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite"),
             contents=prompt
         )
         if response and response.text:
