@@ -382,6 +382,16 @@ def get_seeded_players(db: Session = Depends(get_db)):
     ]
 
 
+def _row_get(row: Any, key: str) -> Any:
+    """
+    Jedno čtení statistiky ze sezóny – ať už je to řádek z databáze
+    (atribut) nebo slovník z ESPN.
+    """
+    if isinstance(row, dict):
+        return row.get(key)
+    return getattr(row, key, None)
+
+
 @app.get("/api/players/{player_id}")
 def get_player_profile(player_id: int, db: Session = Depends(get_db)):
     """Return full player profile with career stats, awards, Wikipedia bio and AI scout report."""
@@ -393,38 +403,55 @@ def get_player_profile(player_id: int, db: Session = Depends(get_db)):
     if not player:
         raise HTTPException(status_code=404, detail="Hráč nebyl nalezen v databázi ani v NBA API.")
 
+    # Sezóny: databáze je nemusí mít (v cloudu NBA API neodpovídá, takže
+    # se hráč uloží jen se jménem a mírami). Pak se vezmou z ESPN, aby
+    # profil nebyl prázdný.
+    season_rows = list(player.stats or [])
+    if not season_rows:
+        try:
+            from services import espn_seasons
+
+            # ESPN zná hráče podle svého čísla (Jordan 1035, ne 893).
+            espn_id = espn_seasons.resolve_id(player_id)
+            season_rows = espn_seasons.player_season_stats(espn_id) or []
+            for row in season_rows:
+                row.setdefault("season_id", row.get("season_id") or "")
+        except Exception as exc:  # pragma: no cover
+            logger.warning("Sezóny hráče %s z ESPN selhaly: %s", player_id, exc)
+
     # Format season stats
     season_stats = []
-    for s in sorted(player.stats, key=lambda x: x.season_id):
+    season_rows.sort(key=lambda x: _row_get(x, "season_id") or "")
+    for s in season_rows:
         season_stats.append({
-            "season_id": s.season_id,
-            "team_abbreviation": s.team_abbreviation,
-            "player_age": s.player_age,
-            "gp": s.gp,
-            "gs": s.gs,
-            "min_per_game": s.min_per_game,
-            "pts": s.pts,
-            "reb": s.reb,
-            "ast": s.ast,
-            "stl": s.stl,
-            "blk": s.blk,
-            "tov": s.tov,
-            "pf": s.pf,
-            "fgm": s.fgm,
-            "fga": s.fga,
-            "fg_pct": s.fg_pct,
-            "fg3m": s.fg3m,
-            "fg3a": s.fg3a,
-            "fg3_pct": s.fg3_pct,
-            "ftm": s.ftm,
-            "fta": s.fta,
-            "ft_pct": s.ft_pct,
-            "poss100_pts": s.poss100_pts,
-            "poss100_reb": s.poss100_reb,
-            "poss100_ast": s.poss100_ast,
-            "poss100_stl": s.poss100_stl,
-            "poss100_blk": s.poss100_blk,
-            "poss100_tov": s.poss100_tov,
+            "season_id": _row_get(s, "season_id"),
+            "team_abbreviation": _row_get(s, "team_abbreviation"),
+            "player_age": _row_get(s, "player_age"),
+            "gp": _row_get(s, "gp"),
+            "gs": _row_get(s, "gs"),
+            "min_per_game": _row_get(s, "min_per_game"),
+            "pts": _row_get(s, "pts"),
+            "reb": _row_get(s, "reb"),
+            "ast": _row_get(s, "ast"),
+            "stl": _row_get(s, "stl"),
+            "blk": _row_get(s, "blk"),
+            "tov": _row_get(s, "tov"),
+            "pf": _row_get(s, "pf"),
+            "fgm": _row_get(s, "fgm"),
+            "fga": _row_get(s, "fga"),
+            "fg_pct": _row_get(s, "fg_pct"),
+            "fg3m": _row_get(s, "fg3m"),
+            "fg3a": _row_get(s, "fg3a"),
+            "fg3_pct": _row_get(s, "fg3_pct"),
+            "ftm": _row_get(s, "ftm"),
+            "fta": _row_get(s, "fta"),
+            "ft_pct": _row_get(s, "ft_pct"),
+            "poss100_pts": _row_get(s, "poss100_pts"),
+            "poss100_reb": _row_get(s, "poss100_reb"),
+            "poss100_ast": _row_get(s, "poss100_ast"),
+            "poss100_stl": _row_get(s, "poss100_stl"),
+            "poss100_blk": _row_get(s, "poss100_blk"),
+            "poss100_tov": _row_get(s, "poss100_tov"),
         })
 
     # Calculate career averages
@@ -773,11 +800,26 @@ def get_closest_player(
         awards_count=len(player.awards or []),
     )
 
-    pool = _external_pool(external, target["id"])
-    if len(pool) < 20:
-        # Externí seznam se nenačetl – porovnává se aspoň mezi hráči,
-        # které aplikace zná (databáze i stažené profily).
-        pool = _local_pool(db, player) + pool
+    # Nabídka = všichni hráči, které zdroj dat zná (sezónní tabulka ESPN
+    # + legendy z jejího seznamu hráčů + profily v paměti). Statistiky
+    # kandidátů bez čísel se dotahují až podle podobnosti v closest_player.
+    raw_pool = nba_external._all_player_pool()
+    if len(raw_pool) < 50:
+        raw_pool = raw_pool + _local_pool(db, player) + _external_pool(external, target["id"])
+    # Z nabídky (jméno + míry) se staví profily; hráči bez statistik
+    # se do počítání nepletou, ti se dotahují až podle podobnosti.
+    pool = [
+        closest_player.build_profile(
+            player_id=row["id"],
+            name=row.get("name", ""),
+            position=row.get("position"),
+            height_cm=row.get("height_cm"),
+            weight_kg=row.get("weight_kg"),
+            stat=row,
+        )
+        for row in raw_pool
+        if int(row.get("id") or 0) != int(target["id"])
+    ]
 
     result = closest_service.build_closest_payload(player, db, pool)
     if not result:
