@@ -606,9 +606,9 @@ _NBA_DOWN_SECONDS = 600
 
 def _nba_is_down() -> bool:
     """True, když NBA API před chvílí selhalo (nebo je vynucen ESPN přes env)."""
-    import os
+    from services import source_switch
 
-    if os.environ.get("NBA_DATA_SOURCE", "").lower() == "espn":
+    if source_switch.espn_first():
         return True
     return time.time() < _NBA_DOWN_UNTIL
 

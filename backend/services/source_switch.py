@@ -15,7 +15,10 @@ logger = logging.getLogger(__name__)
 
 
 def espn_first() -> bool:
-    return os.environ.get("NBA_DATA_SOURCE", "").strip().lower() == "espn"
+    # U existujících služeb Render nemusí změna Blueprintu propsat env.
+    return os.environ.get("RENDER", "").strip().lower() == "true" or (
+        os.environ.get("NBA_DATA_SOURCE", "").strip().lower() == "espn"
+    )
 
 
 def install() -> None:
