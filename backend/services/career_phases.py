@@ -46,7 +46,8 @@ STAT_KEYS = (
     "fg3a",
     "ftm",
     "fta",
-    "min_per_game",
+    "min_per_game", "oreb", "orb_pct", "stl_pct", "blk_pct", "dbpm", "def_rating",
+    "ast_pct", "usg_pct",
 )
 
 
@@ -152,6 +153,12 @@ def _blend(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
     for key in STAT_KEYS:
         result[key] = _weighted(rows, key)
+    from services.shot_context import era_3par
+
+    league = [(era_3par(_season(r)), _games(r) * _num(r.get("fga"))) for r in rows
+              if r.get("fg3a") is not None]
+    league = [(x, w) for x, w in league if x is not None and w > 0]
+    result["era_avg_3par"] = sum(x * w for x, w in league) / sum(w for _, w in league) if league else None
     result["gp"] = sum(_games(r) for r in rows)
     result["seasons"] = [_season(r) for r in rows if _season(r)]
     return result

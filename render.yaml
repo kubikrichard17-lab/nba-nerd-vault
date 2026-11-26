@@ -9,6 +9,9 @@ services:
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
+      # Na Renderu se při požadavku nečeká na stats.nba.com.
+      - key: NBA_DATA_SOURCE
+        value: espn
       # Když proměnná chybí, backend povolí všechny adresy (vývoj i telefon).
       # Pro zpřísnění odkomentuj a doplň adresu frontendu na Vercelu:
       # - key: ALLOWED_ORIGINS

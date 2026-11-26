@@ -192,6 +192,46 @@ def calculate_radar_dimensions(stat: Dict[str, Any], height_cm: float, weight_kg
     }
 
 
+def shot_and_creation_features(stat, season, usage, three_efficiency=None):
+    from services import defense
+    from services.shot_context import era_3par, season_year
+
+    def unit(value):
+        return max(0., min(1., value))
+
+    num = defense.optional_number
+    fga, ast, ast_pct, usg_pct, fta, fg3a = (num(stat.get(k)) for k in
+        ("fga", "ast", "ast_pct", "usg_pct", "fta", "fg3a"))
+    ast100 = defense.per100(ast, stat.get("min_per_game"), season)
+    creation = unit(ast_pct / 50) if ast_pct is not None else unit(ast100 / 15) if ast100 is not None else None
+    usage_source = usg_pct / 100 if usg_pct is not None else usage if fga is not None and num(stat.get("min_per_game")) else None
+    load = None if creation is None or usage_source is None else .65 * creation + .35 * unit((usage_source - .10) / .30)
+    ftr = fta / fga if fga and fta is not None else None
+    year = season_year(season)
+    three = fg3a / fga if fga and fg3a is not None else 0. if year is not None and year < 1979 else None
+    baseline = num(stat.get("era_avg_3par"))
+    if baseline is None:
+        baseline = era_3par(season)
+    orb = num(stat.get("orb_pct"))
+    orb100 = defense.per100(stat.get("oreb"), stat.get("min_per_game"), season)
+    board = unit(orb / 14) if orb is not None else unit(orb100 / 6.4) if orb100 is not None else None
+    rates = defense.defensive_rates(stat, season)
+    signals = [(unit(ftr / .55), .72)] if ftr is not None else []
+    if board is not None:
+        signals.append((board, .20))
+    if rates["blk"] is not None:
+        signals.append((unit(rates["blk"] / (5 if rates["blk_is_pct"] else 3)), .08))
+    rim = sum(v * w for v, w in signals) / sum(w for _, w in signals) if signals else None
+    # Dvoubodový profil, ne měřená vzdálenost střely.
+    mid = None if three is None or ftr is None else (1 - unit(three)) * (
+        .80 * (1 - unit(ftr / .60)) + .20 * (1 - board) if board is not None else 1 - unit(ftr / .60))
+    return {"on_ball_load": load, "pass_to_score": ast / fga if ast is not None and fga else None,
+            "rim_pressure_index": rim, "mid_range_index": mid,
+            "rel_3par": three - baseline if three is not None and baseline is not None else None,
+            "three_efficiency": three_efficiency if fg3a and fg3a >= 1 and (stat.get("fg3m") is not None or stat.get("fg3_pct") is not None) else None,
+            "defensive_rates": rates, "defense_missing": any(rates[k] is None for k in ("dbpm", "def_rating"))}
+
+
 def compare_players(
     p1_info: Dict[str, Any],
     p1_stat: Dict[str, Any],
@@ -236,24 +276,29 @@ def compare_players(
         p2_info.get("weight_kg") or 98.0
     )
 
-    # Comparison table metrics
+    def stat_row(label, key, percent=False):
+        x, y = (p.get(key) for p in (p1_stat, p2_stat))
+        def display(value):
+            if value is None:
+                return "—"
+            return f"{100 * value:.1f} %" if percent else round(value, 1)
+        delta = x - y if x is not None and y is not None else None
+        diff = f"{100 * delta:+.1f} p. b." if percent and delta is not None else display(delta)
+        return {"metric": label, "p1": display(x), "p2": display(y), "diff": diff}
+
     comp_table = [
-        {"metric": "Výška (cm)", "p1": p1_info.get("height_cm", "-"), "p2": p2_info.get("height_cm", "-"), "diff": round((p1_info.get("height_cm") or 0) - (p2_info.get("height_cm") or 0), 1)},
-        {"metric": "Váha (kg)", "p1": p1_info.get("weight_kg", "-"), "p2": p2_info.get("weight_kg", "-"), "diff": round((p1_info.get("weight_kg") or 0) - (p2_info.get("weight_kg") or 0), 1)},
-        {"metric": "Body / zápas (PPG)", "p1": p1_stat.get("pts", 0), "p2": p2_stat.get("pts", 0), "diff": round(p1_stat.get("pts", 0) - p2_stat.get("pts", 0), 1)},
-        {"metric": "Doskoky / zápas (RPG)", "p1": p1_stat.get("reb", 0), "p2": p2_stat.get("reb", 0), "diff": round(p1_stat.get("reb", 0) - p2_stat.get("reb", 0), 1)},
-        {"metric": "Asistence / zápas (APG)", "p1": p1_stat.get("ast", 0), "p2": p2_stat.get("ast", 0), "diff": round(p1_stat.get("ast", 0) - p2_stat.get("ast", 0), 1)},
-        {"metric": "Zisky / zápas (SPG)", "p1": p1_stat.get("stl", 0), "p2": p2_stat.get("stl", 0), "diff": round(p1_stat.get("stl", 0) - p2_stat.get("stl", 0), 1)},
-        {"metric": "Bloky / zápas (BPG)", "p1": p1_stat.get("blk", 0), "p2": p2_stat.get("blk", 0), "diff": round(p1_stat.get("blk", 0) - p2_stat.get("blk", 0), 1)},
-        {"metric": "Úspěšnost střelby z pole (FG %)", "p1": f"{(p1_stat.get('fg_pct', 0) * 100):.1f} %", "p2": f"{(p2_stat.get('fg_pct', 0) * 100):.1f} %", "diff": f"{((p1_stat.get('fg_pct', 0) - p2_stat.get('fg_pct', 0)) * 100):+.1f} %"},
-        {"metric": "Úspěšnost trojek (3P %)", "p1": f"{(p1_stat.get('fg3_pct', 0) * 100):.1f} %", "p2": f"{(p2_stat.get('fg3_pct', 0) * 100):.1f} %", "diff": f"{((p1_stat.get('fg3_pct', 0) - p2_stat.get('fg3_pct', 0)) * 100):+.1f} %"},
-        {"metric": "Trestné hody (FT %)", "p1": f"{(p1_stat.get('ft_pct', 0) * 100):.1f} %", "p2": f"{(p2_stat.get('ft_pct', 0) * 100):.1f} %", "diff": f"{((p1_stat.get('ft_pct', 0) - p2_stat.get('ft_pct', 0)) * 100):+.1f} %"},
-        {"metric": "Podíl bodů z trojek", "p1": f"{(p1_stat.get('three_pts_share') or 0) * 100:.0f} %", "p2": f"{(p2_stat.get('three_pts_share') or 0) * 100:.0f} %", "diff": f"{((p1_stat.get('three_pts_share') or 0) - (p2_stat.get('three_pts_share') or 0)) * 100:+.0f} %"},
-        {"metric": "Podíl bodů ze šestek", "p1": f"{(p1_stat.get('ft_pts_share') or 0) * 100:.0f} %", "p2": f"{(p2_stat.get('ft_pts_share') or 0) * 100:.0f} %", "diff": f"{((p1_stat.get('ft_pts_share') or 0) - (p2_stat.get('ft_pts_share') or 0)) * 100:+.0f} %"},
-        {"metric": "Body na 100 držení míče", "p1": p1_stat.get("poss100_pts", 0), "p2": p2_stat.get("poss100_pts", 0), "diff": round(p1_stat.get("poss100_pts", 0) - p2_stat.get("poss100_pts", 0), 1)},
-        {"metric": "Doskoky na 100 držení míče", "p1": p1_stat.get("poss100_reb", 0), "p2": p2_stat.get("poss100_reb", 0), "diff": round(p1_stat.get("poss100_reb", 0) - p2_stat.get("poss100_reb", 0), 1)},
-        {"metric": "Asistence na 100 držení míče", "p1": p1_stat.get("poss100_ast", 0), "p2": p2_stat.get("poss100_ast", 0), "diff": round(p1_stat.get("poss100_ast", 0) - p2_stat.get("poss100_ast", 0), 1)},
-    ]
+        {"metric": label, "p1": p1_info.get(key), "p2": p2_info.get(key),
+         "diff": round(p1_info[key] - p2_info[key], 1) if all(p.get(key) is not None for p in (p1_info, p2_info)) else "—"}
+        for label, key in (("Výška (cm)", "height_cm"), ("Váha (kg)", "weight_kg"))
+    ] + [stat_row(label, key, percent) for label, key, percent in (
+        ("Body / zápas (PPG)", "pts", False), ("Doskoky / zápas (RPG)", "reb", False),
+        ("Asistence / zápas (APG)", "ast", False), ("Zisky / zápas (SPG)", "stl", False),
+        ("Bloky / zápas (BPG)", "blk", False), ("Úspěšnost střelby z pole (FG %)", "fg_pct", True),
+        ("Úspěšnost trojek (3P %)", "fg3_pct", True), ("Trestné hody (FT %)", "ft_pct", True),
+        ("Podíl bodů z trojek", "three_pts_share", True), ("Podíl bodů ze šestek", "ft_pts_share", True),
+        ("Body na 100 držení míče", "poss100_pts", False), ("Doskoky na 100 držení míče", "poss100_reb", False),
+        ("Asistence na 100 držení míče", "poss100_ast", False),
+    )]
 
     return {
         "match_pct": total_match_pct,

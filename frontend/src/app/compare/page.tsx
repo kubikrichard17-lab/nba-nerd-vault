@@ -21,8 +21,8 @@ import { API } from '@/lib/api';
 export default function ComparePage() {
   const [p1Id, setP1Id] = useState<number>(893); // Michael Jordan
   const [p2Id, setP2Id] = useState<number>(977); // Kobe Bryant
-  const [p1Season, setP1Season] = useState<string>('career');
-  const [p2Season, setP2Season] = useState<string>('career');
+  const [p1Season, setP1Season] = useState<string>('prime');
+  const [p2Season, setP2Season] = useState<string>('prime');
 
   const [compareData, setCompareData] = useState<CompareResponse | null>(null);
   const style: StyleCompareResult | null = compareData?.style ?? null;
@@ -108,7 +108,7 @@ export default function ComparePage() {
               selectedPlayer={compareData?.player1 ?? null}
               onSelectPlayer={(id) => {
                 setP1Id(id);
-                setP1Season('career');
+                setP1Season('prime');
               }}
             />
 
@@ -153,7 +153,7 @@ export default function ComparePage() {
               selectedPlayer={compareData?.player2 ?? null}
               onSelectPlayer={(id) => {
                 setP2Id(id);
-                setP2Season('career');
+                setP2Season('prime');
               }}
             />
 

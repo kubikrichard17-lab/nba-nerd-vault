@@ -40,6 +40,7 @@ HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; NBA-Nerd-Vault/1.0)"}
 STAT_MAP = {
     "avgPoints": "pts",
     "avgRebounds": "reb",
+    "avgOffensiveRebounds": "oreb",
     "avgAssists": "ast",
     "avgSteals": "stl",
     "avgBlocks": "blk",

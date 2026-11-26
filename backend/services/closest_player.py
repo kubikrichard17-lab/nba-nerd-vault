@@ -42,9 +42,11 @@ from typing import Any, Dict, List, Optional, Tuple
 logger = logging.getLogger(__name__)
 
 from services import defense
+from services.similarity_engine import shot_and_creation_features
 
 # Když se změní prompt nebo logika, zvyš číslo – stará cache se přestane používat.
-ENGINE_VERSION = 28
+ENGINE_VERSION = 29
+SIMILARITY_WEIGHTS = {"style": .56, "physical": .11, "stats": .17, "defense": .16}
 
 # Kolik kandidátů se AI pošle (víc = horší soustředění, méně = může chybět správný)
 CANDIDATE_LIMIT = 12
@@ -481,18 +483,6 @@ def build_profile(
     blk = _num(stat.get("blk"))
     tov = _num(stat.get("tov"))
     fga = max(_num(stat.get("fga"), 1.0), 1.0)
-    # Když se trojky nedaly zjistit (kandidát z ESPN), odhadnou se z objemu
-    # střelby a šestek. Když ale zdroj uvádí nulu, je to skutečná nula –
-    # Jordan (1986-88) trojky skoro neházel a nesmí se z něj stát trojkař.
-    if stat.get("fg3a") is None:
-        stat = dict(stat)
-        fta_guess = _num(stat.get("fta"), 0.0)
-        three_guess = max(fga * 0.25 - fta_guess * 0.4, 0.6)
-        stat["fg3a"] = round(min(three_guess, fga * 0.6), 2)
-        stat["fg3m"] = round(stat["fg3a"] * 0.35, 2)
-        stat["fgm"] = _num(stat.get("fgm"), 0.0) or round(
-            (_num(stat.get("pts"), 0.0) - 0.44 * fta_guess - 3 * stat["fg3m"]) / 2.0, 2
-        )
     fg3a = _num(stat.get("fg3a"))
     fg3m = _num(stat.get("fg3m"))
     fgm = _num(stat.get("fgm"))
@@ -525,11 +515,7 @@ def build_profile(
         "two_rate": _clamp(two_pa / fga, 0.0, 1.0),
         "three_rate": three_rate,
         "paint_share": _clamp(two_pm / fga, 0.0, 1.0),
-        # Podíl střel, které jdou z bezprostřední blízkosti koše. NBA API
-        # přesnou vzdálenost nemá, ale dá se odhadnout: hráč, který nedá
-        # trojky, střílí zblízka i ze střední vzdálenosti – proto se
-        # „blízko koše" bere z poměru dvoubodových střel a šestek.
-        "rim_rate": _clamp((two_pa * 0.62) / fga, 0.0, 1.0),
+        "rim_rate": 0.0,
         "three_pts_share": _clamp((3.0 * fg3m) / max(pts, 1.0), 0.0, 0.8),
         "ft_pts_share": _clamp(ftm / max(pts, 1.0), 0.0, 0.5),
     }
@@ -562,7 +548,7 @@ def build_profile(
 
     # --- Per 100 držení (tempo éry), obrana, postava, střelecký profil ---
     seasons_list = stat.get("seasons") if isinstance(stat.get("seasons"), list) else []
-    season_hint = (seasons_list[0] if seasons_list else None) or stat.get("season")
+    season_hint = (seasons_list[len(seasons_list) // 2] if seasons_list else None) or stat.get("season_id") or stat.get("season")
     mins_raw = stat.get("min_per_game")
     pts100 = defense.per100(stat.get("pts"), mins_raw, season_hint)
     reb100 = defense.per100(stat.get("reb"), mins_raw, season_hint)
@@ -581,11 +567,6 @@ def build_profile(
     ath_score = defense.athleticism_score(ft_rate, shot_profile["two_rate"], stocks100)
     gravity = defense.shooting_gravity(fg3m, fg3a, fg3_pct)
     pos_type = position_type(position, height_cm)
-    # Obecné G neurčuje roli. U produktivního guarda zohledni tempo,
-    # tvorbu pro spoluhráče i ztráty, nikoli jen jeho výšku.
-    if (_norm(position) in {"g", "guard"} and ast >= 5.0 and (ast100 or 0) >= 8.0
-            and tov > 0 and ast >= 2.0 * tov and ast > reb):
-        pos_type = "PG"
     profile = {
         "role_group": group,
         "height_cm": _num(height_cm, 198.0),
@@ -605,7 +586,7 @@ def build_profile(
         "rim_rate": shot_profile["rim_rate"],
         "three_pts_share": shot_profile["three_pts_share"],
         "ft_pts_share": shot_profile["ft_pts_share"],
-        "ft_pct": ft_pct,
+        "ft_pct": ft_pct if stat.get("fta") and (stat.get("ft_pct") is not None or stat.get("ftm") is not None) else None,
         "fgm": fgm,
         "ftm": ftm,
         "creator": round(play_style["creator"], 3),
@@ -613,10 +594,13 @@ def build_profile(
         "volume": round(play_style["volume"], 3),
         "athletic": round(play_style["athletic"], 3),
     }
+    features = shot_and_creation_features(stat, season_hint, usage, fg3_pct)
+    profile["rim_rate"] = features["rim_pressure_index"] or 0.0
     arch = archetype(profile)
     profile["scoring_mode"] = scoring_mode(profile)
 
     return {
+        **features,
         "id": player_id,
         "espn_id": stat.get("espn_id"),
         "name": name,
@@ -634,19 +618,19 @@ def build_profile(
         "fg3m": fg3m,
         "fg_pct": fg_pct,
         "fg3_pct": fg3_pct,
-        "ft_pct": ft_pct,
+        "ft_pct": profile["ft_pct"],
         "three_rate": round(three_rate, 3),
         "two_rate": round(shot_profile["two_rate"], 3),
         "paint_share": round(shot_profile["paint_share"], 3),
         "creator": round(play_style["creator"], 3),
         "rebounder": round(play_style["rebounder"], 3),
-        "volume": round(play_style["volume"], 3),
+        "volume": round(play_style["volume"], 3) if stat.get("fga") is not None else None,
         "athletic": round(play_style["athletic"], 3),
-        "rim_rate": round(shot_profile["rim_rate"], 3),
+        "rim_rate": features["rim_pressure_index"],
         "three_pts_share": round(shot_profile["three_pts_share"], 3),
         "ft_pts_share": round(shot_profile["ft_pts_share"], 3),
         "usage": round(usage, 3),
-        "ts": round(ts, 3),
+        "ts": round(ts, 3) if stat.get("fga") and stat.get("fta") is not None else None,
         "fta": fta,
         "scoring_mode": profile["scoring_mode"],
         "role_group": group,
@@ -736,125 +720,75 @@ def _similarity(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, float]:
     physical_pct = _physical_similarity(a, b)
     stats_pct = _stats_similarity(a, b)
 
-    total = 0.62 * style_pct + 0.22 * physical_pct + 0.16 * stats_pct
-
-    # Stejný styl, ale jiná postava (jiná výška/váha) nesmí vyjít na 99 %.
-    if physical_pct < 95.0:
-        total = min(total, 78.0 + physical_pct * 0.21)
-
-    # Objem hry: hráč s výrazně nižším počtem bodů není stejná kategorie.
-    pts_a = _num(a.get("pts"))
-    pts_b = _num(b.get("pts"))
-    if pts_a > 0 and pts_b > 0:
-        ratio = min(pts_a, pts_b) / max(pts_a, pts_b)
-        if ratio < 0.85:
-            total -= (0.85 - ratio) * 90.0
-
-    # Obranná úroveň: elitní obránce se nepodobá slabému, i když styl sedí.
-    try:
-        total -= defense.defense_penalty(
-            a.get("defense_tier") or "average", b.get("defense_tier") or "average"
-        )
-    except Exception:  # pragma: no cover
-        pass
-
-    if a.get("role_group") != b.get("role_group"):
-        total -= 12.0
-    if a.get("position_type") != b.get("position_type"):
-        total -= 4.0
+    defense_pct, coverage = defense.defense_similarity(a.get("defensive_rates", {}), b.get("defensive_rates", {}))
+    weights = dict(SIMILARITY_WEIGHTS)
+    weights["defense"] *= coverage
+    weights["style"] += SIMILARITY_WEIGHTS["defense"] - weights["defense"]
+    total = (weights["style"] * style_pct + weights["physical"] * physical_pct
+             + weights["stats"] * stats_pct + weights["defense"] * (defense_pct or 0))
+    load_gap = _feature_gap(a, b, "on_ball_load")
+    pass_gap = _feature_gap(a, b, "pass_to_score")
+    total -= min(8., 16 * max(0., (load_gap or 0) - .13) + 12 * max(0., (pass_gap or 0) - .16))
     return {
         "match_pct": round(_clamp(total), 1),
         "style_pct": round(style_pct, 1),
         "physical_pct": round(physical_pct, 1),
         "stats_pct": round(stats_pct, 1),
+        "defense_pct": round(defense_pct, 1) if defense_pct is not None else None,
+        "weights": {key: round(value, 4) for key, value in weights.items()},
     }
 
 
+def _feature_gap(a, b, key):
+    x, y = a.get(key), b.get(key)
+    return abs(x - y) if x is not None and y is not None else None
+
+
 def _style_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
-    """Jak moc se hráči podobají stylem hry (archetyp, střelba, obrana)."""
-    score = 0.0
-    arch_a, arch_b = a.get("archetype"), b.get("archetype")
-    if arch_a and arch_a == arch_b:
-        score += 38.0
-    elif related_arch(a, b):
-        score += 24.0
-
-    # způsob střílení
-    mode_a, mode_b = a.get("scoring_mode"), b.get("scoring_mode")
-    if mode_a and mode_a == mode_b:
-        score += 20.0
-    elif mode_a and mode_b:
-        score += 8.0
-
-    # střelba z dálky – rozdíl 0 = plná shoda, rozdíl 3 (žádná vs elitní) = 0
-    grav_a = _num(a.get("gravity"))
-    grav_b = _num(b.get("gravity"))
-    score += max(0.0, 16.0 - abs(grav_a - grav_b) * 5.5)
-
-    # obrana
-    tier_a = a.get("defense_tier") or "average"
-    tier_b = b.get("defense_tier") or "average"
-    if tier_a == tier_b:
-        score += 14.0
-    elif defense.defense_penalty(tier_a, tier_b) <= 10.0:
-        score += 7.0
-
-    # úroveň hráče: superstar se nemá rovnat s role playerem jen proto,
-    # že mají podobný styl (Jordan a Larry Bird nejsou stejná kategorie)
-    tier_a = a.get("tier_label") or ""
-    tier_b = b.get("tier_label") or ""
-    if tier_a and tier_a == tier_b:
-        score += 10.0
-    elif tier_a and tier_b and "superstar" in tier_a and "superstar" not in tier_b:
-        score -= 18.0
-    elif tier_b and tier_a and "superstar" in tier_b and "superstar" not in tier_a:
-        score -= 18.0
-
-    # typ postavy (explozivní / dlouhý a hubený / silový)
-    if a.get("build_type") and a.get("build_type") == b.get("build_type"):
-        score += 8.0
-    elif a.get("build_type") and b.get("build_type"):
-        score += 3.0
-
-    # podíl bodů z trojek
-    three_a = three_share(a)
-    three_b = three_share(b)
-    score += max(0.0, 4.0 - abs(three_a - three_b) * 20.0)
-
-    return _clamp(score)
+    scores = []
+    for key, weight, scale in (
+        ("rel_3par", 13, .48), ("three_efficiency", 14, .20),
+        ("rim_pressure_index", 21, .62), ("mid_range_index", 10, .65),
+        ("on_ball_load", 20, .66), ("pass_to_score", 11, .5),
+        ("volume", 6, .75), ("ft_pct", 5, .25),
+    ):
+        gap = _feature_gap(a, b, key)
+        if gap is not None:
+            scores.append((weight, max(0., 1 - gap / scale)))
+    return 100 * sum(w * score for w, score in scores) / sum(w for w, _ in scores) if scores else 0.
 
 
 def _physical_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     """Výška, váha a atletičnost – jak moc jsou si hráči tělesně podobní."""
     height_gap = abs(_num(a.get("height_cm"), 198.0) - _num(b.get("height_cm"), 198.0))
     weight_gap = abs(_num(a.get("weight_kg"), 95.0) - _num(b.get("weight_kg"), 95.0))
-    ath_gap = abs(_num(a.get("athletic_score"), 0.6) - _num(b.get("athletic_score"), 0.6))
 
     score = 100.0
     score -= min(height_gap * 1.9, 45.0)
     score -= min(weight_gap * 0.55, 30.0)
-    score -= min(ath_gap * 45.0, 25.0)
     return _clamp(score)
 
 
 def _stats_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     """Statistický dopad: body, doskoky, asistence, obrana a efektivita."""
     pairs = [
-        ("pts", 1.0),
-        ("reb", 2.2),
-        ("ast", 2.2),
-        ("stl", 12.0),
-        ("blk", 12.0),
-        ("ts", 100.0),
+        ("pts", 2.6),
+        ("reb", 1.8),
+        ("ast", 1.8),
+        ("ts", 5.0),
+        ("fg3a", 1.0 if a.get("three_rate", 0) > .40 and b.get("three_rate", 0) > .40 else 0.0),
     ]
     diffs: List[float] = []
     total_weight = 0.0
     for key, weight in pairs:
-        va = _num(a.get(key))
-        vb = _num(b.get(key))
+        if a.get(key) is None or b.get(key) is None or not weight:
+            continue
+        va, vb = a[key], b[key]
         if va <= 0 and vb <= 0:
             continue
         base = max((va + vb) / 2.0, 0.35 if key not in ("pts", "reb", "ast") else 1.0)
+        if key == "ts":
+            base = .15
         diffs.append(min(abs(va - vb) / base, 1.0) * weight)
         total_weight += weight
 
@@ -883,7 +817,7 @@ def compare_pair(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
     same_arch = a["archetype"] == b["archetype"]
     same_pos = a["position_type"] == b["position_type"]
     return {
-        "match_pct": sim["match_pct"],
+        **sim,
         "style_pct": sim["style_pct"],
         "physical_pct": sim["physical_pct"],
         "stats_pct": sim["stats_pct"],
@@ -1546,22 +1480,35 @@ def enrich_awards(target: Dict[str, Any], candidates: List[Dict[str, Any]]) -> L
     return out or candidates
 
 
+def same_player(a, b):
+    from services.nba_external import normalize_name
+
+    name_a, name_b = (normalize_name(p.get("name", "")) for p in (a, b))
+    return (a["id"] == b["id"] or bool(name_a and name_a == name_b)
+            or bool(a.get("espn_id") and str(a["espn_id"]) == str(b.get("espn_id"))))
+
+
 def resolve_cached(target: Dict[str, Any], pool: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Pořadí podle role a střelby, uvnitř nejbližší skupiny podle shody."""
     if not target.get("pts"):
         return None
     from services.nba_external import normalize_name
 
-    name = normalize_name(target["name"])
-    candidates = [c for c in pool if c["id"] != target["id"] and c["pts"] > 0
-                  and normalize_name(c["name"]) != name
-                  and (target["role_group"] == "big") == (c["role_group"] == "big")
+    candidates = [c for c in pool if not same_player(target, c) and c["pts"] > 0
                   and abs(target["height_cm"] - c["height_cm"]) <= 12
                   and min(c["pts"], target["pts"]) / max(c["pts"], target["pts"]) >= 0.65
-                  and abs(three_share(target) - three_share(c)) <= 0.25]
+                  and (_feature_gap(target, c, "rel_3par") is None
+                       or _feature_gap(target, c, "rel_3par") <= .20 + 1e-9)]
     if not candidates:
         return None
     ranked = sorted(candidates, key=lambda c: (-_similarity(target, c)["match_pct"], c["id"]))
+    unique = []
+    for candidate in ranked:
+        if not any(same_player(candidate, other) for other in unique):
+            unique.append(candidate)
+        if len(unique) == 3:
+            break
+    ranked = unique
     chosen = ranked[0]
     sim = _similarity(target, chosen)
     texts = _fallback_texts(target, chosen)
@@ -1571,7 +1518,7 @@ def resolve_cached(target: Dict[str, Any], pool: List[Dict[str, Any]]) -> Option
         "player_role": target["role_label"], "player_tier": target["tier_label"],
         "closest": {"id": chosen["id"], "full_name": chosen["name"],
                     "position": chosen["position"], "role_label": chosen["role_label"], **sim},
-        "top_3_candidates": [{"id": c["id"], "name": c["name"], "why": _fallback_why(target, c)} for c in ranked[:3]],
+        "top_3_candidates": [{"id": c["id"], "name": c["name"], "match_pct": _similarity(target, c)["match_pct"], "why": _fallback_why(target, c)} for c in ranked[:3]],
         "match_percentage": sim["match_pct"],
         "reasoning": _fallback_reasoning(target), **texts,
         "breakdown": {"herni_styl": texts["style_comparison"], "fyzicko": texts["physical_comparison"],

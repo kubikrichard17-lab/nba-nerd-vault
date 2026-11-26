@@ -69,6 +69,41 @@ def per100(value: Any, minutes: Any, season_id: Optional[str]) -> Optional[float
     return round(v * (48.0 / max(m, 1.0)) * (100.0 / era_pace(season_id)), 2)
 
 
+def optional_number(value):
+    import math
+
+    v = _num(value)
+    return v if v is not None and math.isfinite(v) else None
+
+
+def defensive_rates(stat, season):
+    from services.shot_context import season_year
+
+    result = {"dbpm": optional_number(stat.get("dbpm")), "def_rating": optional_number(stat.get("def_rating"))}
+    year = season_year(season)
+    for k in ("stl", "blk"):
+        pct = optional_number(stat.get(k + "_pct"))
+        per = per100(stat.get(k), stat.get("min_per_game"), season)
+        result[k] = pct if pct is not None else per if year is None or year >= 1973 else None
+        result[k + "_is_pct"] = pct is not None
+        result[k + "100"] = per if year is None or year >= 1973 else None
+    return result
+
+
+def defense_similarity(a, b):
+    """Podobnost společně dostupných metrik; vrací i pokrytí obrany."""
+    scores = []
+    for k, weight, scale in (("stl", .43, 2.0), ("blk", .37, 2.0),
+                             ("dbpm", .14, 5.0), ("def_rating", .06, 12.0)):
+        x, y = a.get(k), b.get(k)
+        if k in ("stl", "blk") and a.get(k + "_is_pct") != b.get(k + "_is_pct"):
+            x, y = a.get(k + "100"), b.get(k + "100")
+        if x is not None and y is not None:
+            scores.append((weight, max(0., 100. * (1 - abs(x - y) / scale))))
+    coverage = sum(w for w, _ in scores)
+    return (sum(w * s for w, s in scores) / coverage if coverage else None), coverage
+
+
 def empty_awards() -> Dict[str, int]:
     return {"mvp": 0, "dpoy": 0, "all_nba": 0, "all_def": 0}
 

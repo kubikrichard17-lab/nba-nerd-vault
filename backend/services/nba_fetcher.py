@@ -521,6 +521,9 @@ def _player_from_espn(player_id: int, db: Session) -> Optional[Player]:
         if not career:
             return None
         seasons = espn_seasons.player_season_stats(player_id, espn_id=espn_id, allow_legacy=not _nba_is_down())
+        if seasons and career.get("name"):
+            from services import nba_external
+            nba_external._cache_set(f"espn-identity:v1:{player_id}", {"name": career["name"], "espn_id": espn_id})
     except Exception as exc:  # pragma: no cover
         logger.warning("ESPN profil %s selhal: %s", player_id, exc)
         return None

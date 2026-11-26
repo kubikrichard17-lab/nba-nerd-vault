@@ -21,7 +21,6 @@ from services.nba_fetcher import (
 )
 from services.similarity_engine import compare_players
 from services import closest_service
-from services.ai_scout import generate_comparison_verdict
 from services import nba_news
 import settings
 from services import (
@@ -65,6 +64,8 @@ def health_check():
         "status": "online",
         "app": "NBA Nerd Vault",
         "phase": 1,
+        "similarity_engine": closest_player.ENGINE_VERSION,
+        "data_source": "espn" if source_switch.espn_first() else "nba",
         "database": "SQLite (nba_vault.db)"
     }
 
@@ -741,7 +742,7 @@ def get_closest_player(
     # Nejdřív databáze; když v ní hráč není, dotáhne se z NBA API.
     # Když je NBA API zrovna nedostupné a hráč v databázi je, počítá se dál.
     player = db.query(Player).filter(Player.id == player_id).first()
-    if not player or (source_switch.espn_first() and not player.stats):
+    if not player or not player.stats:
         player = fetch_and_cache_player(player_id=player_id, db=db)
     if player is not None:
         # ID z NBA musí mít správné jméno – data ze záložního zdroje mohla
@@ -750,7 +751,8 @@ def get_closest_player(
     if not player:
         raise HTTPException(status_code=404, detail="Hráč nebyl nalezen v databázi ani v NBA API.")
 
-    cache_key = f"closest:v{closest_player.ENGINE_VERSION}:{player.id}"
+    player = closest_service.canonical_player(player, db)
+    cache_key = f"closest:v{closest_player.ENGINE_VERSION}:{closest_service.advanced_cache.revision()}:{player.id}"
 
     # Stará cache z předchozí verze výpočtu se maže, aby se výsledky
     # přegenerovaly a nezůstaly v ní špatné shody.
@@ -785,33 +787,7 @@ def get_closest_player(
     # Srovnává se vrcholná verze hráče (Prime), ne zkreslený kariérní
     # průměr. U hráčů, kteří během kariéry změnili styl, se navíc počítá
     # raná a pozdní fáze – viz services/career_phases.py.
-    espn_first = source_switch.espn_first()
-
-    # Nabídka = všichni hráči, které zdroj dat zná (sezónní tabulka ESPN
-    # + legendy z jejího seznamu hráčů + profily v paměti). Statistiky
-    # kandidátů bez čísel se dotahují až podle podobnosti v closest_player.
-    raw_pool = nba_external.cached_comparison_rows() if espn_first else nba_external._all_player_pool()
-    if not espn_first and len(raw_pool) < 50:
-        external = nba_external.career_profile(player.id, player.full_name)
-        raw_pool = raw_pool + _external_pool(external, player.id)
-    # Z nabídky (jméno + míry) se staví profily; hráči bez statistik
-    # se do počítání nepletou, ti se dotahují až podle podobnosti.
-    pool = [
-        closest_player.build_profile(
-            player_id=row["id"],
-            name=row.get("name", ""),
-            position=row.get("position"),
-            height_cm=row.get("height_cm"),
-            weight_kg=row.get("weight_kg"),
-            stat=row,
-        )
-        for row in raw_pool
-        if row.get("id") and int(row["id"]) != player.id
-    ]
-
-    if not espn_first and len(pool) < 50:
-        pool.extend(_local_pool(db, player))
-    result = closest_service.build_closest_payload(player, db, pool)
+    result = closest_service.build_closest_payload(player, db, nba_external.cached_comparison_rows())
     if not result:
         return {"closest": None, "reasoning": None, "breakdown": None}
 
@@ -1002,12 +978,41 @@ def get_last_game(player_id: int):
 class CompareRequest(BaseModel):
     p1_id: int
     p2_id: int
-    season1: Optional[str] = "career"
-    season2: Optional[str] = "career"
+    season1: Optional[str] = "prime"
+    season2: Optional[str] = "prime"
+
+
+def _comparison_player(player_id, db):
+    cached = db.get(Player, player_id)
+    player = cached if cached is not None and cached.stats else fetch_and_cache_player(player_id, db)
+    return closest_service.canonical_player(player, db) if player is not None else None
+
+
+_PHASE_LABELS = {"prime": "Vrchol kariéry", "early": "Raná kariéra", "late": "Pozdní kariéra"}
+
+
+def _comparison_options(player):
+    rows, _, phases = closest_service.phase_metadata(player)
+    return ([{"id": "prime", "label": _PHASE_LABELS["prime"]}]
+            + [{"id": p["key"], "label": p["label"]} for p in phases["phases"]]
+            + [{"id": "career", "label": "Celá kariéra (průměr)"}]
+            + [{"id": row["season_id"], "label": row["season_id"]} for row in rows])
 
 
 def _get_target_stat(player: Player, season_id: Optional[str]) -> Dict[str, Any]:
     """Helper to get stats for comparison (either career average or specific season)."""
+    if season_id in _PHASE_LABELS:
+        _, _, phases = closest_service.phase_metadata(player)
+        phase = phases["prime"] if season_id == "prime" else next(
+            (p for p in phases["phases"] if p["key"] == season_id), None)
+        if phase:
+            stat = phase["stat"]
+            ratio = lambda a, b: (stat.get(a) or 0) / stat[b] if stat.get(b) else None
+            from services.defense import per100
+            return {**stat, "season_id": season_id, "fg_pct": ratio("fgm", "fga"),
+                    "fg3_pct": ratio("fg3m", "fg3a"), "ft_pct": ratio("ftm", "fta"),
+                    **{f"poss100_{key}": per100(stat.get(key), stat.get("min_per_game"), phase["season"])
+                       for key in ("pts", "reb", "ast", "stl", "blk", "tov")}}
     if season_id and season_id != "career":
         for s in player.stats:
             if s.season_id == season_id:
@@ -1057,18 +1062,14 @@ def compare_two_players(req: CompareRequest, db: Session = Depends(get_db)):
     Compare two NBA players using scikit-learn Similarity Engine,
     generating total %, sub-metrics, radar overlay and Czech AI verdict.
     """
-    p1 = fetch_and_cache_player(req.p1_id, db)
-    p2 = fetch_and_cache_player(req.p2_id, db)
+    p1 = _comparison_player(req.p1_id, db)
+    p2 = _comparison_player(req.p2_id, db)
 
     if not p1 or not p2:
         raise HTTPException(status_code=404, detail="Jeden nebo oba hráči nebyli nalezeni.")
 
-    s1_key = req.season1 or "career"
-    s2_key = req.season2 or "career"
-    cache_key = f"cmp_{p1.id}_{p2.id}_{s1_key}_{s2_key}"
-
-    cached = db.query(ComparisonCache).filter(ComparisonCache.cache_key == cache_key).first()
-
+    s1_key = req.season1 or "prime"
+    s2_key = req.season2 or "prime"
     stat1 = _get_target_stat(p1, s1_key)
     stat2 = _get_target_stat(p2, s2_key)
 
@@ -1125,40 +1126,7 @@ def compare_two_players(req: CompareRequest, db: Session = Depends(get_db)):
         unified=unified,
     )
 
-    cache_key = f"{cache_key}_v{closest_player.ENGINE_VERSION}"
-    cached = (
-        db.query(ComparisonCache)
-        .filter(ComparisonCache.cache_key == cache_key)
-        .first()
-    )
-
-    if cached and cached.ai_verdict:
-        ai_verdict = cached.ai_verdict
-    elif source_switch.espn_first():
-        ai_verdict = (unified or {}).get("style_note") or "Shoda vychází z dostupných statistik a herního stylu."
-    else:
-        ai_verdict = generate_comparison_verdict(
-            p1_name=p1.full_name,
-            p2_name=p2.full_name,
-            p1_data=p1_info,
-            p2_data=p2_info,
-            match_pct=comp_results["match_pct"],
-            physical_pct=comp_results["physical_pct"],
-            stat_pct=comp_results["statistical_pct"],
-            style_pct=comp_results["stylistic_pct"]
-        )
-        # Store in cache
-        if not cached:
-            new_cache = ComparisonCache(
-                cache_key=cache_key,
-                match_pct=comp_results["match_pct"],
-                physical_pct=comp_results["physical_pct"],
-                statistical_pct=comp_results["statistical_pct"],
-                stylistic_pct=comp_results["stylistic_pct"],
-                ai_verdict=ai_verdict
-            )
-            db.add(new_cache)
-            db.commit()
+    ai_verdict = unified.get("style_note") or "Shoda vychází z dostupných statistik a herního stylu."
 
     return {
         "player1": {
@@ -1170,9 +1138,7 @@ def compare_two_players(req: CompareRequest, db: Session = Depends(get_db)):
             "headshot_url": p1.headshot_url,
             "selected_season": stat1["season_id"],
             "stat": stat1,
-            "available_seasons": [{"id": "career", "label": "Celá kariéra (Průměr)"}] + [
-                {"id": s.season_id, "label": s.season_id} for s in sorted(p1.stats, key=lambda x: x.season_id)
-            ]
+            "available_seasons": _comparison_options(p1)
         },
         "player2": {
             "id": p2.id,
@@ -1183,9 +1149,7 @@ def compare_two_players(req: CompareRequest, db: Session = Depends(get_db)):
             "headshot_url": p2.headshot_url,
             "selected_season": stat2["season_id"],
             "stat": stat2,
-            "available_seasons": [{"id": "career", "label": "Celá kariéra (Průměr)"}] + [
-                {"id": s.season_id, "label": s.season_id} for s in sorted(p2.stats, key=lambda x: x.season_id)
-            ]
+            "available_seasons": _comparison_options(p2)
         },
         "match_pct": comp_results["match_pct"],
         "physical_pct": comp_results["physical_pct"],
@@ -1227,127 +1191,15 @@ def _unified_payload(
     }
 
 
-def _build_style_profile(player: Player, season: Optional[str] = None) -> Dict[str, Any]:
-    """
-    Profil hráče pro sjednocený model.
-
-    Pro „celá kariéra" bere kariérní data z externích zdrojů (stejně jako
-    hlavní stránka). Pro konkrétní sezónu dosadí čísla té sezóny do stejného
-    profilu – archetyp, styl i postava se pak počítají z ní.
-    """
-    if source_switch.espn_first() and not season:
-        return closest_service.prime_for_player(player)
-    external = nba_external.career_profile(player.id, player.full_name) or {}
-
-    if season and season != "career":
-        row = next((s for s in player.stats if s.season_id == season), None)
-        if row:
-            stat = {
-                "pts": row.pts or 0.0,
-                "reb": row.reb or 0.0,
-                "ast": row.ast or 0.0,
-                "stl": row.stl or 0.0,
-                "blk": row.blk or 0.0,
-                "tov": row.tov or 0.0,
-                "fgm": row.fgm or 0.0,
-                "fga": row.fga or 0.0,
-                "fg3m": row.fg3m or 0.0,
-                "fg3a": row.fg3a or 0.0,
-                "ftm": row.ftm or 0.0,
-                "fta": row.fta or 0.0,
-                "fg_pct": row.fg_pct or 0.0,
-                "fg3_pct": row.fg3_pct or 0.0,
-                "ft_pct": row.ft_pct or 0.0,
-                "min_per_game": row.min_per_game or 32.0,
-            }
-            return closest_player.build_profile(
-                player_id=player.id,
-                name=player.full_name,
-                # pozice a postava se nemění – berou se z kariérního profilu
-                position=external.get("position") or player.position,
-                height_cm=external.get("height_cm") or player.height_cm,
-                weight_kg=external.get("weight_kg") or player.weight_kg,
-                stat=stat,
-                awards_count=len(player.awards or []),
-            )
-
-    stat = dict(external) if external else _get_target_stat(player, "career")
-    return closest_player.build_profile(
-        player_id=player.id,
-        name=player.full_name,
-        position=external.get("position") or player.position,
-        height_cm=external.get("height_cm") or player.height_cm,
-        weight_kg=external.get("weight_kg") or player.weight_kg,
-        stat=stat,
-        awards_count=len(player.awards or []),
-    )
-
-
-def _unified_comparison(
-    p1: Player,
-    p2: Player,
-    season1: Optional[str] = None,
-    season2: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
-    """
-    Porovnání stejnou logikou jako hlavní stránka.
-
-    Kariérní shoda je vždy stejná jako na hlavní stránce. Když je vybraná
-    sezóna, dopočítá se shoda z čísel té sezóny a kariérní číslo se o ten
-    rozdíl upraví. Pro „celá kariéra" vyjde přesně číslo z hlavní stránky.
-    """
-    try:
-        career1 = _build_style_profile(p1)
-        career2 = _build_style_profile(p2)
-        base = closest_player.compare_pair(career1, career2)
-
-        # Profil pro každého hráče zvlášť (dřív se omylem míchaly postavy
-        # obou hráčů, takže sezónní čísla vycházela špatně).
-        seasonal = []
-        for player, season, career in ((p1, season1, career1), (p2, season2, career2)):
-            if season and season != "career":
-                seasonal.append(
-                    closest_player.build_profile(
-                        player_id=player.id,
-                        name=player.full_name,
-                        position=career["position"],
-                        height_cm=career["height_cm"],
-                        weight_kg=career["weight_kg"],
-                        stat=_season_stat(player, season),
-                        awards_count=len(player.awards or []),
-                    )
-                )
-            else:
-                seasonal.append(career)
-
-        if all(season and season != "career" for season in (season1, season2)):
-            season_pair = closest_player.compare_pair(seasonal[0], seasonal[1])
-            # stejné parametry, jen čísla z vybrané sezóny
-            delta = season_pair["match_pct"] - base["match_pct"]
-            adjusted = max(0.0, min(99.0, base["match_pct"] + delta))
-            return {
-                **base,
-                "match_pct": round(adjusted, 1),
-                "style_pct": season_pair["style_pct"],
-                "physical_pct": season_pair["physical_pct"],
-                "stats_pct": season_pair["stats_pct"],
-                "style_note": season_pair.get("style_note", base.get("style_note", "")),
-                "season_mode": True,
-                "career_match_pct": base["match_pct"],
-                "_p1": seasonal[0],
-                "_p2": seasonal[1],
-                "_career_p1": career1,
-                "_career_p2": career2,
-            }
-
-        base["season_mode"] = False
-        base["career_match_pct"] = base["match_pct"]
-        base["_career_p1"] = career1
-        base["_career_p2"] = career2
-        return base
-    except Exception as exc:  # pragma: no cover
-        logger.warning("Sjednocené porovnání selhalo: %s", exc)
-        return None
+def _unified_comparison(p1, p2, season1=None, season2=None):
+    key1, key2 = season1 or "prime", season2 or "prime"
+    a, b = closest_service.phase_for_player(p1, key1), closest_service.phase_for_player(p2, key2)
+    if a is None or b is None:
+        raise HTTPException(status_code=422, detail="Pro vybranou fázi nebo sezónu nejsou dostupné statistiky.")
+    if closest_player.same_player(a, b):
+        raise HTTPException(status_code=422, detail="Hráče nelze porovnat se sebou samým.")
+    return {**closest_player.compare_pair(a, b), "phase1": key1, "phase2": key2,
+            "season_mode": key1 not in (*_PHASE_LABELS, "career") or key2 not in (*_PHASE_LABELS, "career")}
 
 
 def _season_stat(player: Player, season: str) -> Dict[str, Any]:
@@ -1383,53 +1235,9 @@ def compare_players_style(req: CompareRequest, db: Session = Depends(get_db)):
     postava a statistiky. Díky tomu stejná dvojice nikdy neukáže dvě
     různá procenta na dvou místech aplikace.
     """
-    p1 = db.query(Player).filter(Player.id == req.p1_id).first()
-    p2 = db.query(Player).filter(Player.id == req.p2_id).first()
-    if not p1:
-        p1 = fetch_and_cache_player(req.p1_id, db)
-    if not p2:
-        p2 = fetch_and_cache_player(req.p2_id, db)
+    p1 = _comparison_player(req.p1_id, db)
+    p2 = _comparison_player(req.p2_id, db)
     if not p1 or not p2:
         raise HTTPException(status_code=404, detail="Jeden nebo oba hráči nebyli nalezeni.")
 
-    def _profile(player: Player) -> Dict[str, Any]:
-        external = nba_external.career_profile(player.id, player.full_name) or {}
-        stat = dict(external) if external else _get_target_stat(player, "career")
-        return closest_player.build_profile(
-            player_id=player.id,
-            name=player.full_name,
-            position=external.get("position") or player.position,
-            height_cm=external.get("height_cm") or player.height_cm,
-            weight_kg=external.get("weight_kg") or player.weight_kg,
-            stat=stat,
-            awards_count=len(player.awards or []),
-        )
-
-    profile1 = _build_style_profile(p1) if source_switch.espn_first() else _profile(p1)
-    profile2 = _build_style_profile(p2) if source_switch.espn_first() else _profile(p2)
-    pair = closest_player.compare_pair(profile1, profile2)
-
-    return {
-        "engine_version": closest_player.ENGINE_VERSION,
-        "player1": {
-            "id": p1.id,
-            "full_name": p1.full_name,
-            "headshot_url": p1.headshot_url,
-            "archetype": profile1["archetype_label"],
-            "position": profile1["position_label"],
-            "three_pts_share": profile1.get("three_pts_share"),
-            "two_rate": profile1.get("two_rate"),
-            "ft_pts_share": profile1.get("ft_pts_share"),
-        },
-        "player2": {
-            "id": p2.id,
-            "full_name": p2.full_name,
-            "headshot_url": p2.headshot_url,
-            "archetype": profile2["archetype_label"],
-            "position": profile2["position_label"],
-            "three_pts_share": profile2.get("three_pts_share"),
-            "two_rate": profile2.get("two_rate"),
-            "ft_pts_share": profile2.get("ft_pts_share"),
-        },
-        **pair,
-    }
+    return _unified_payload(p1, p2, _unified_comparison(p1, p2, req.season1, req.season2))
