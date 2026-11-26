@@ -45,7 +45,7 @@ from services import defense
 from services.similarity_engine import shot_and_creation_features
 
 # Když se změní prompt nebo logika, zvyš číslo – stará cache se přestane používat.
-ENGINE_VERSION = 29
+ENGINE_VERSION = 30
 SIMILARITY_WEIGHTS = {"style": .56, "physical": .11, "stats": .17, "defense": .16}
 
 # Kolik kandidátů se AI pošle (víc = horší soustředění, méně = může chybět správný)
@@ -262,6 +262,7 @@ ROLE_GROUP_LABEL = {
 
 
 ARCHETYPE_LABEL = {
+    "primary_playmaker": "hlavní tvůrce hry (Primary Playmaker)",
     "rim_runner": "síla a atletičnost pod košem",
     "scoring_pg": "skórující rozehrávač",
     "pass_first_pg": "pas-first rozehrávač",
@@ -502,7 +503,9 @@ def build_profile(
 
     three_rate = _clamp(fg3a / fga, 0.0, 1.0)
     usage = _clamp(((fga + 0.44 * fta + tov) * 48.0 / minutes) / 100.0, 0.08, 0.45)
-    ts = _clamp((pts / (2.0 * (fga + 0.44 * fta))) if fga else fg_pct, 0.0, 1.0)
+    from services.advanced_cache import derive_boxscore
+
+    ts = defense.optional_number(derive_boxscore(stat, include_rates=False).get("ts"))
 
     # Odkud hráč skóruje: pod košem (2PT) vs. za trojkou. Tohle rozliší
     # Giannise (91 % střel za dva) od Duranta (73 %), i když mají stejná
@@ -596,11 +599,14 @@ def build_profile(
     }
     features = shot_and_creation_features(stat, season_hint, usage, fg3_pct)
     profile["rim_rate"] = features["rim_pressure_index"] or 0.0
-    arch = archetype(profile)
+    arch = "primary_playmaker" if features["primary_playmaker"] else archetype(profile)
+    spatial = _spatial_profile(height_cm, weight_kg, pos_type, features, reb100)
     profile["scoring_mode"] = scoring_mode(profile)
 
     return {
         **features,
+        "spatial_profile": spatial,
+        "listed_weight_kg": defense.optional_number(weight_kg) or None,
         "id": player_id,
         "espn_id": stat.get("espn_id"),
         "name": name,
@@ -630,7 +636,7 @@ def build_profile(
         "three_pts_share": round(shot_profile["three_pts_share"], 3),
         "ft_pts_share": round(shot_profile["ft_pts_share"], 3),
         "usage": round(usage, 3),
-        "ts": round(ts, 3) if stat.get("fga") and stat.get("fta") is not None else None,
+        "ts": round(_clamp(ts, 0., 1.), 3) if ts is not None else None,
         "fta": fta,
         "scoring_mode": profile["scoring_mode"],
         "role_group": group,
@@ -708,6 +714,23 @@ def three_share(p: Dict[str, Any]) -> float:
     return _clamp(3.0 * fg3m / pts, 0.0, 0.8)
 
 
+def _spatial_profile(height, weight, position, features, reb100):
+    height, weight = defense.optional_number(height), defense.optional_number(weight)
+    if not height:
+        return None
+    bmi = weight / (height / 100) ** 2 if weight and weight > 0 else None
+    orb = features["orb_signal"]
+    trb = features["trb_pct"]
+    relative = features["rel_3par"]
+    boards = (trb is not None and trb >= 16) or (reb100 is not None and reb100 >= 14)
+    if height >= 208 and weight and weight >= 120 and (position == "C" or boards or (orb or 0) >= .45):
+        return "heavy_paint"
+    if height >= 205 and boards and (position == "C" or (relative is not None and relative <= -.10)
+            or (bmi is not None and bmi >= 25 and (orb or 0) >= .58)):
+        return "true_center"
+    return "perimeter"
+
+
 def _similarity(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, float]:
     """
     Shoda dvou profilů: herní styl, fyzicko a statistiky.
@@ -728,6 +751,14 @@ def _similarity(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, float]:
              + weights["stats"] * stats_pct + weights["defense"] * (defense_pct or 0))
     load_gap = _feature_gap(a, b, "on_ball_load")
     pass_gap = _feature_gap(a, b, "pass_to_score")
+    if {a.get("spatial_profile"), b.get("spatial_profile")} & {"heavy_paint", "true_center"} and (
+        "perimeter" in (a.get("spatial_profile"), b.get("spatial_profile"))
+    ):
+        total -= 11.
+    if both_centers(a, b):
+        gap = _feature_gap(a, b, "listed_weight_kg")
+        if gap is not None:
+            total -= min(9., .8 * max(0., gap - 22.))
     total -= min(8., 16 * max(0., (load_gap or 0) - .13) + 12 * max(0., (pass_gap or 0) - .16))
     return {
         "match_pct": round(_clamp(total), 1),
@@ -750,12 +781,35 @@ def _style_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
         ("rel_3par", 13, .48), ("three_efficiency", 14, .20),
         ("rim_pressure_index", 21, .62), ("mid_range_index", 10, .65),
         ("on_ball_load", 20, .66), ("pass_to_score", 11, .5),
-        ("volume", 6, .75), ("ft_pct", 5, .25),
+        ("ft_pct", 8, .25), ("ftr", 3, .56),
     ):
         gap = _feature_gap(a, b, key)
         if gap is not None:
             scores.append((weight, max(0., 1 - gap / scale)))
-    return 100 * sum(w * score for w, score in scores) / sum(w for w, _ in scores) if scores else 0.
+    if a.get("spatial_profile") in ("heavy_paint", "true_center") and b.get("spatial_profile") in ("heavy_paint", "true_center"):
+        gap = _feature_gap(a, b, "orb_signal")
+        if gap is not None:
+            scores.append((9, max(0., 1 - gap / .72)))
+    style = 100 * sum(w * score for w, score in scores) / sum(w for w, _ in scores) if scores else 0.
+    # Dvě křídla s podobným skórováním nemusí stejně často řídit útok.
+    load_gap = _feature_gap(a, b, "on_ball_load")
+    pass_gap = _feature_gap(a, b, "pass_to_score")
+    if (load_gap is not None and pass_gap is not None and not both_centers(a, b)
+            and min(a.get("pass_to_score") or 0., b.get("pass_to_score") or 0.) >= .22):
+        style -= min(5., 30 * max(0., load_gap - .10) + 20 * max(0., pass_gap - .045))
+    vertical = _feature_gap(a, b, "vertical_athleticism")
+    if vertical is not None and _height_gap_cm(a, b) <= 9:
+        # Obrana již zohledňuje bloky a zisky; nedvojit ji u všech dvojic.
+        contrasting_handlers = a.get("primary_playmaker") != b.get("primary_playmaker")
+        if contrasting_handlers and min(a.get("pass_to_score") or 0, b.get("pass_to_score") or 0) >= .30:
+            style -= min(6., 50 * max(0., vertical - .025))
+        else:
+            style -= min(6., 20 * max(0., vertical - .24))
+    return _clamp(style)
+
+
+def both_centers(a, b):
+    return all(p.get("spatial_profile") in ("heavy_paint", "true_center") for p in (a, b))
 
 
 def _physical_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
@@ -765,7 +819,9 @@ def _physical_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
 
     score = 100.0
     score -= min(height_gap * 1.9, 45.0)
-    score -= min(weight_gap * 0.55, 30.0)
+    centers = both_centers(a, b)
+    if a.get("listed_weight_kg") and b.get("listed_weight_kg"):
+        score -= min(weight_gap * (.95 if centers else .55), 38. if centers else 30.)
     return _clamp(score)
 
 
@@ -1492,13 +1548,17 @@ def resolve_cached(target: Dict[str, Any], pool: List[Dict[str, Any]]) -> Option
     """Pořadí podle role a střelby, uvnitř nejbližší skupiny podle shody."""
     if not target.get("pts"):
         return None
-    from services.nba_external import normalize_name
+    def eligible(c):
+        if same_player(target, c) or not c.get("pts") or _height_gap_cm(target, c) > 12:
+            return False
+        gap = _feature_gap(target, c, "rel_3par")
+        limit = .28 if both_centers(target, c) else .20
+        if gap is not None and gap > limit + 1e-9:
+            return False
+        ratio = min(c["pts"], target["pts"]) / max(c["pts"], target["pts"])
+        return ratio >= .65 or (ratio >= .58 and _style_similarity(target, c) > 82)
 
-    candidates = [c for c in pool if not same_player(target, c) and c["pts"] > 0
-                  and abs(target["height_cm"] - c["height_cm"]) <= 12
-                  and min(c["pts"], target["pts"]) / max(c["pts"], target["pts"]) >= 0.65
-                  and (_feature_gap(target, c, "rel_3par") is None
-                       or _feature_gap(target, c, "rel_3par") <= .20 + 1e-9)]
+    candidates = [c for c in pool if eligible(c)]
     if not candidates:
         return None
     ranked = sorted(candidates, key=lambda c: (-_similarity(target, c)["match_pct"], c["id"]))

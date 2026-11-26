@@ -20,7 +20,7 @@ from services.nba_fetcher import (
     ensure_correct_name,
 )
 from services.similarity_engine import compare_players
-from services import closest_service
+from services import advanced_cache, closest_service
 from services import nba_news
 import settings
 from services import (
@@ -984,7 +984,16 @@ class CompareRequest(BaseModel):
 
 def _comparison_player(player_id, db):
     cached = db.get(Player, player_id)
-    player = cached if cached is not None and cached.stats else fetch_and_cache_player(player_id, db)
+    if cached is not None and cached.stats:
+        return closest_service.canonical_player(cached, db)
+    nba_id, name = advanced_cache.nba_id_for_espn(player_id)
+    if nba_id is not None:
+        alternate = db.get(Player, nba_id)
+        if alternate is not None and alternate.stats and (
+            nba_external.normalize_name(alternate.full_name) == nba_external.normalize_name(name)
+        ):
+            return alternate
+    player = fetch_and_cache_player(player_id, db)
     return closest_service.canonical_player(player, db) if player is not None else None
 
 
@@ -1007,7 +1016,7 @@ def _get_target_stat(player: Player, season_id: Optional[str]) -> Dict[str, Any]
             (p for p in phases["phases"] if p["key"] == season_id), None)
         if phase:
             stat = phase["stat"]
-            ratio = lambda a, b: (stat.get(a) or 0) / stat[b] if stat.get(b) else None
+            ratio = lambda a, b: stat[a] / stat[b] if stat.get(a) is not None and stat.get(b) else None
             from services.defense import per100
             return {**stat, "season_id": season_id, "fg_pct": ratio("fgm", "fga"),
                     "fg3_pct": ratio("fg3m", "fg3a"), "ft_pct": ratio("ftm", "fta"),

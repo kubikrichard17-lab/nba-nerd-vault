@@ -216,7 +216,9 @@ def shot_and_creation_features(stat, season, usage, three_efficiency=None):
     orb100 = defense.per100(stat.get("oreb"), stat.get("min_per_game"), season)
     board = unit(orb / 14) if orb is not None else unit(orb100 / 6.4) if orb100 is not None else None
     rates = defense.defensive_rates(stat, season)
-    signals = [(unit(ftr / .55), .72)] if ftr is not None else []
+    relative_three = three - baseline if three is not None and baseline is not None else None
+    ft_weight = .72 * (1 - min(.32, max(relative_three or 0., 0.) * 1.6))
+    signals = [(unit(ftr / .55), ft_weight)] if ftr is not None else []
     if board is not None:
         signals.append((board, .20))
     if rates["blk"] is not None:
@@ -225,9 +227,19 @@ def shot_and_creation_features(stat, season, usage, three_efficiency=None):
     # Dvoubodový profil, ne měřená vzdálenost střely.
     mid = None if three is None or ftr is None else (1 - unit(three)) * (
         .80 * (1 - unit(ftr / .60)) + .20 * (1 - board) if board is not None else 1 - unit(ftr / .60))
-    return {"on_ball_load": load, "pass_to_score": ast / fga if ast is not None and fga else None,
+    # Boxscore proxy, nikoli měření výskoku. Použij pouze společně dostupné signály.
+    vertical = {"orb": board, "blk": unit(rates["blk"] / (5 if rates["blk_is_pct"] else 3)) if rates["blk"] is not None else None,
+                "stl": unit(rates["stl"] / 4) if rates["stl"] is not None else None}
+    weights = {"orb": .40, "blk": .45, "stl": .15}
+    observed = [(v, weights[k]) for k, v in vertical.items() if v is not None]
+    vertical_index = sum(v * w for v, w in observed) / sum(w for _, w in observed) if len(observed) >= 2 else None
+    primary = (ast_pct >= 35 and usg_pct >= 30) if ast_pct is not None and usg_pct is not None else (
+        load is not None and load >= .76 and ast is not None and fga and ast/fga >= .35)
+    return {"primary_playmaker": bool(primary), "vertical_athleticism": vertical_index,
+            "orb_signal": board, "trb_pct": num(stat.get("trb_pct")), "ftr": ftr,
+            "on_ball_load": load, "pass_to_score": ast / fga if ast is not None and fga else None,
             "rim_pressure_index": rim, "mid_range_index": mid,
-            "rel_3par": three - baseline if three is not None and baseline is not None else None,
+            "rel_3par": relative_three,
             "three_efficiency": three_efficiency if fg3a and fg3a >= 1 and (stat.get("fg3m") is not None or stat.get("fg3_pct") is not None) else None,
             "defensive_rates": rates, "defense_missing": any(rates[k] is None for k in ("dbpm", "def_rating"))}
 

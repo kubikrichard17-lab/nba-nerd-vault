@@ -163,7 +163,7 @@ def build_closest_payload(player, db, raw_pool):
     if not phases.get("prime"):
         return None
     # Sezónní souhrny udržované existujícími importy; bez žádostí o data při výběru.
-    # Kariérní průměr je předvýběr, nikdy zdroj finálního procenta.
+    # Vrchol sezóny je předvýběr, nikdy zdroj finálního procenta.
     players = db.query(Player).options(selectinload(Player.stats)).filter(Player.stats.any()).all()
     by_id = {int(row["id"]): row for row in raw_pool if row.get("id")}
     by_name = {nba_external.normalize_name(row.get("name")): row for row in raw_pool if row.get("name")}
@@ -179,15 +179,18 @@ def build_closest_payload(player, db, raw_pool):
         identity = {"id": other.id, "name": other.full_name, "espn_id": espn_id}
         if closest_player.same_player(base, identity) or not advanced_cache.consistent_career(other):
             continue
-        roster.append((other, phase_metadata(other)))
+        metadata = phase_metadata(other)
+        credible = [r for r in metadata[0] if r.get("gp", 0) >= 45] or metadata[0]
+        peak = max((r.get("pts") or 0 for r in credible), default=0.)
+        roster.append((other, metadata, peak))
 
     def resolve(target, phase_key):
         profiles = []
-        for other, metadata in roster:
+        for other, metadata, peak in roster:
             career = metadata[1]
             if abs(career["height_cm"] - target["height_cm"]) > 12:
                 continue
-            if career["pts"] < target["pts"] * .50:
+            if peak < target["pts"] * .58:
                 continue
             profile = phase_for_player(other, phase_key, prepared=metadata)
             if profile:

@@ -296,7 +296,9 @@ def ensure_correct_name(player: Player, db: Session) -> Player:
     expected = canonical_name(player.id)
     if not expected:
         return player
-    if (player.full_name or "").strip().lower() == expected.lower():
+    from services.nba_external import normalize_name
+
+    if normalize_name(player.full_name) == normalize_name(expected):
         return player
 
     logger.warning(

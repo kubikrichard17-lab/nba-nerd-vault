@@ -10,7 +10,7 @@ Kariérní průměr z toho udělá hráče, který neexistoval.
 
 Tenhle modul z reálných sezón spočítá:
 
-1. **Prime** – tři po sobě jdoucí sezóny s nejvyšším výkonem (body, objem,
+1. **Prime** – jedna až tři souvislé sezóny s nejvyšším výkonem (body, objem,
    minuty). Z nich se udělá průměr – to je „verze hráče na vrcholu".
 2. **Fáze kariéry** – kariéra se rozdělí na první a druhou polovinu podle
    odehraných zápasů. U každé se zjistí, jestli se změnil způsob hraní
@@ -47,7 +47,7 @@ STAT_KEYS = (
     "ftm",
     "fta",
     "min_per_game", "oreb", "orb_pct", "stl_pct", "blk_pct", "dbpm", "def_rating",
-    "ast_pct", "usg_pct",
+    "ast_pct", "usg_pct", "trb_pct",
 )
 
 
@@ -161,7 +161,8 @@ def _blend(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     result["era_avg_3par"] = sum(x * w for x, w in league) / sum(w for _, w in league) if league else None
     result["gp"] = sum(_games(r) for r in rows)
     result["seasons"] = [_season(r) for r in rows if _season(r)]
-    return result
+    from services.advanced_cache import derive_boxscore
+    return derive_boxscore(result, include_rates=False)
 
 
 def _score(row: Dict[str, Any]) -> float:
@@ -176,25 +177,26 @@ def _score(row: Dict[str, Any]) -> float:
 
 
 def prime_window(seasons: Sequence[Dict[str, Any]], window: int = 3) -> List[Dict[str, Any]]:
-    """
-    Tři po sobě jdoucí sezóny s nejvyšším výkonem. Když hráč odehrál méně
-    sezón, bere se jich tolik, kolik má.
-    """
-    rows = [r for r in seasons if _games(r) > 0]
-    if not rows:
-        return []
-    if len(rows) <= window:
-        return list(rows)
+    """Preferuj stabilní vrchol; kratší okno musí vyhrát přesvědčivě."""
+    from services.shot_context import season_year
 
-    best_start = 0
-    best_score = -1.0
-    for start in range(len(rows) - window + 1):
-        chunk = rows[start : start + window]
-        score = sum(_score(r) for r in chunk)
-        if score > best_score:
-            best_score = score
-            best_start = start
-    return list(rows[best_start : best_start + window])
+    rows = sorted((r for r in seasons if _games(r) > 0), key=_season)
+    qualified = [r for r in rows if _games(r) >= 45 and season_year(_season(r)) is not None]
+    if not qualified:
+        return [max(rows, key=_score)] if rows else []
+    windows = []
+    for length in range(1, min(3, window, len(qualified)) + 1):
+        for i in range(len(qualified) - length + 1):
+            chunk = qualified[i:i + length]
+            years = [season_year(_season(r)) for r in chunk]
+            if years[-1] - years[0] != length - 1 or len(set(years)) != length:
+                continue
+            raw = sum(_score(r) for r in chunk) / length
+            # Delší kariéra dává větší jistotu, že krátké okno je výkyv.
+            reliability = {1: .81, 2: .88, 3: 1.} if len(qualified) >= 9 else {1: .87, 2: .94, 3: 1.}
+            adjusted = raw * reliability[length]
+            windows.append((adjusted, length, -years[0], chunk))
+    return list(max(windows, key=lambda item: item[:3])[3])
 
 
 def _split_phases(seasons: Sequence[Dict[str, Any]]) -> Optional[List[Dict[str, Any]]]:

@@ -3,7 +3,7 @@ from services import nba_external
 
 KEY = "advanced-nba:v1:"
 BBR_KEY = "advanced-bbr:v1:"
-ADVANCED = ("ast_pct", "usg_pct", "orb_pct", "stl_pct", "blk_pct", "dbpm", "def_rating", "oreb")
+ADVANCED = ("ast_pct", "usg_pct", "orb_pct", "stl_pct", "blk_pct", "dbpm", "def_rating", "oreb", "trb_pct")
 
 
 def revision():
@@ -29,6 +29,42 @@ def consistent_career(player):
     tables = [nba_external._cache_get(BBR_KEY + str(s.season_id), nba_external.TTL_PROFILE)
               for s in player.stats if s.gp and s.gp >= 20]
     return not tables or not all(tables) or any(name in t for t in tables)
+
+
+def nba_id_for_espn(espn_id):
+    """Pouze dříve ověřené odkazy; žádné porovnávání stejných čísel napříč zdroji."""
+    matches = set()
+    for key in nba_external._load_memory()["entries"]:
+        if not key.startswith("espn-identity:v1:"):
+            continue
+        link = nba_external._cache_get(key, nba_external.TTL_PROFILE) or {}
+        if str(link.get("espn_id")) == str(espn_id) and link.get("name"):
+            nba_id = int(key.rsplit(":", 1)[-1])
+            if nba_id != espn_id:
+                matches.add((nba_id, link["name"]))
+    return next(iter(matches)) if len(matches) == 1 else (None, None)
+
+
+def derive_boxscore(row, include_rates=True):
+    from services.defense import optional_number, per100
+
+    result = dict(row)
+    num = lambda k: optional_number(row.get(k))
+    fga, fta, pts, three = map(num, ("fga", "fta", "pts", "fg3a"))
+    if fga is not None and fga > 0:
+        for key, value in (("ts", pts / (2 * (fga + .44 * fta)) if pts is not None and fta is not None and fta >= 0 else None),
+                           ("ftr", fta / fga if fta is not None else None),
+                           ("3par", three / fga if three is not None else None)):
+            if num(key) is None and value is not None:
+                result[key] = value
+    minutes = num("min_per_game")
+    if include_rates and minutes and minutes > 0:
+        for key in ("pts", "reb", "ast", "blk", "stl", "oreb"):
+            value = num(key)
+            if value is not None:
+                result.setdefault(key + "36", value * 36 / minutes)
+                result.setdefault(key + "100", per100(value, minutes, row.get("season_id")))
+    return result
 
 
 def enrich(player_id, name, rows, espn_id=None):
@@ -60,7 +96,7 @@ def enrich(player_id, name, rows, espn_id=None):
                 for k in (*ADVANCED, "ast", "stl", "blk", "fga", "fta", "fg3a"):
                     if row.get(k) is None and source.get(k) is not None:
                         row[k] = optional_number(source[k])
-        result.append(row)
+        result.append(derive_boxscore(row))
     return result
 
 
@@ -78,6 +114,7 @@ def import_nba_season(season, timeout=15):
         pid, name = int(row["PLAYER_ID"]), row["PLAYER_NAME"]
         stats = {key: optional_number(row.get(col)) for key, col in (
             ("ast_pct", "AST_PCT"), ("orb_pct", "OREB_PCT"), ("usg_pct", "USG_PCT"),
+            ("trb_pct", "REB_PCT"),
             ("def_rating", "DEF_RATING"), ("gp", "GP"),
         )}
         for key in ("ast_pct", "orb_pct", "usg_pct"):
