@@ -25,7 +25,7 @@ export default function ComparePage() {
   const [p2Season, setP2Season] = useState<string>('career');
 
   const [compareData, setCompareData] = useState<CompareResponse | null>(null);
-  const [style, setStyle] = useState<StyleCompareResult | null>(null);
+  const style: StyleCompareResult | null = compareData?.style ?? null;
   const [isLoading, setIsLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -51,20 +51,6 @@ export default function ComparePage() {
       const data = await res.json();
       setCompareData(data);
 
-      // Stejný model, jaký používá „nejbližší hráč" na hlavní stránce.
-      // Počítá se ze kariérních dat, proto se posílá bez volby sezóny.
-      try {
-        const styleRes = await fetch(`${API}/api/compare/style`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ p1_id: p1Id, p2_id: p2Id }),
-        });
-        if (styleRes.ok) {
-          setStyle(await styleRes.json());
-        }
-      } catch {
-        setStyle(null);
-      }
     } catch (err: any) {
       console.error(err);
       setError(err.message || 'Chyba připojení k backendu.');
@@ -346,7 +332,7 @@ export default function ComparePage() {
               <div className="flex items-center gap-2 text-amber-400 mb-2">
                 <Sparkles className="w-4 h-4" />
                 <span className="text-xs font-bold uppercase tracking-wider">
-                  Analytický AI Verdikt srovnání (Gemini API v češtině)
+                  Analytické shrnutí srovnání
                 </span>
               </div>
               <p className="text-sm sm:text-base text-slate-200 leading-relaxed font-serif italic bg-slate-950/70 p-4 rounded-2xl border border-slate-800/60">

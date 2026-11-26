@@ -407,15 +407,11 @@ def get_player_profile(player_id: int, db: Session = Depends(get_db)):
     # se hráč uloží jen se jménem a mírami). Pak se vezmou z ESPN, aby
     # profil nebyl prázdný.
     season_rows = list(player.stats or [])
-    if not season_rows:
+    if not season_rows and not source_switch.espn_first():
         try:
             from services import espn_seasons
 
-            # ESPN zná hráče podle svého čísla (Jordan 1035, ne 893).
-            espn_id = espn_seasons.resolve_id(player_id)
-            season_rows = espn_seasons.player_season_stats(espn_id) or []
-            for row in season_rows:
-                row.setdefault("season_id", row.get("season_id") or "")
+            season_rows = espn_seasons.player_season_stats(player_id, name=player.full_name) or []
         except Exception as exc:  # pragma: no cover
             logger.warning("Sezóny hráče %s z ESPN selhaly: %s", player_id, exc)
 
@@ -571,7 +567,8 @@ def _club_career(player: Player) -> List[Dict[str, Any]]:
     a když ani to ne, složí se aspoň z toho, co je v databázi.
     """
     try:
-        external = nba_external.career_clubs(player.id, player.full_name)
+        external = (nba_external._cache_get(f"clubs:{player.id}", nba_external.TTL_PROFILE)
+                    if source_switch.espn_first() else nba_external.career_clubs(player.id, player.full_name))
         clubs = external.get("clubs") if isinstance(external, dict) else None
         if clubs:
             return clubs
@@ -592,7 +589,7 @@ def _club_career(player: Player) -> List[Dict[str, Any]]:
             "fg3m": s.fg3m or 0.0,
         }
         for s in player.stats
-        if s.team_abbreviation
+        if s.team_abbreviation and s.team_abbreviation != "TOT"
     ]
     if not rows:
         return []
@@ -744,7 +741,7 @@ def get_closest_player(
     # Nejdřív databáze; když v ní hráč není, dotáhne se z NBA API.
     # Když je NBA API zrovna nedostupné a hráč v databázi je, počítá se dál.
     player = db.query(Player).filter(Player.id == player_id).first()
-    if not player:
+    if not player or (source_switch.espn_first() and not player.stats):
         player = fetch_and_cache_player(player_id=player_id, db=db)
     if player is not None:
         # ID z NBA musí mít správné jméno – data ze záložního zdroje mohla
@@ -788,24 +785,15 @@ def get_closest_player(
     # Srovnává se vrcholná verze hráče (Prime), ne zkreslený kariérní
     # průměr. U hráčů, kteří během kariéry změnili styl, se navíc počítá
     # raná a pozdní fáze – viz services/career_phases.py.
-    external = nba_external.career_profile(player.id, player.full_name)
-    stat = dict(external) if external else _get_target_stat(player, "career")
-    target = closest_player.build_profile(
-        player_id=player.id,
-        name=player.full_name,
-        position=(external or {}).get("position") or player.position,
-        height_cm=(external or {}).get("height_cm") or player.height_cm,
-        weight_kg=(external or {}).get("weight_kg") or player.weight_kg,
-        stat=stat,
-        awards_count=len(player.awards or []),
-    )
+    espn_first = source_switch.espn_first()
 
     # Nabídka = všichni hráči, které zdroj dat zná (sezónní tabulka ESPN
     # + legendy z jejího seznamu hráčů + profily v paměti). Statistiky
     # kandidátů bez čísel se dotahují až podle podobnosti v closest_player.
-    raw_pool = nba_external._all_player_pool()
-    if len(raw_pool) < 50:
-        raw_pool = raw_pool + _local_pool(db, player) + _external_pool(external, target["id"])
+    raw_pool = nba_external.cached_comparison_rows() if espn_first else nba_external._all_player_pool()
+    if not espn_first and len(raw_pool) < 50:
+        external = nba_external.career_profile(player.id, player.full_name)
+        raw_pool = raw_pool + _external_pool(external, player.id)
     # Z nabídky (jméno + míry) se staví profily; hráči bez statistik
     # se do počítání nepletou, ti se dotahují až podle podobnosti.
     pool = [
@@ -818,9 +806,11 @@ def get_closest_player(
             stat=row,
         )
         for row in raw_pool
-        if int(row.get("id") or 0) != int(target["id"])
+        if row.get("id") and int(row["id"]) != player.id
     ]
 
+    if not espn_first and len(pool) < 50:
+        pool.extend(_local_pool(db, player))
     result = closest_service.build_closest_payload(player, db, pool)
     if not result:
         return {"closest": None, "reasoning": None, "breakdown": None}
@@ -1047,33 +1037,18 @@ def _get_target_stat(player: Player, season_id: Optional[str]) -> Dict[str, Any]
 
     # Default to career average
     stats = player.stats
-    total_gp = sum(s.gp for s in stats)
+    total_gp = sum(s.gp or 0 for s in stats)
     if total_gp == 0:
         return {"season_id": "career", "pts": 0, "reb": 0, "ast": 0, "stl": 0, "blk": 0, "tov": 0, "fg_pct": 0, "fg3_pct": 0, "ft_pct": 0, "fga": 0, "fg3a": 0, "fg3m": 0, "fta": 0, "poss100_pts": 0, "poss100_reb": 0, "poss100_ast": 0, "poss100_stl": 0, "poss100_blk": 0, "poss100_tov": 0}
 
-    return {
-        "season_id": "Kariéra",
-        "pts": round(sum(s.pts * s.gp for s in stats) / total_gp, 1),
-        "reb": round(sum(s.reb * s.gp for s in stats) / total_gp, 1),
-        "ast": round(sum(s.ast * s.gp for s in stats) / total_gp, 1),
-        "stl": round(sum(s.stl * s.gp for s in stats) / total_gp, 1),
-        "blk": round(sum(s.blk * s.gp for s in stats) / total_gp, 1),
-        "tov": round(sum(s.tov * s.gp for s in stats) / total_gp, 1),
-        "fg_pct": round(sum(s.fg_pct * s.gp for s in stats) / total_gp, 3),
-        "fg3_pct": round(sum(s.fg3_pct * s.gp for s in stats) / total_gp, 3),
-        "ft_pct": round(sum(s.ft_pct * s.gp for s in stats) / total_gp, 3),
-        "fga": round(sum(s.fga * s.gp for s in stats) / total_gp, 1),
-        "fg3a": round(sum(s.fg3a * s.gp for s in stats) / total_gp, 1),
-        "fg3m": round(sum((s.fg3m or 0) * s.gp for s in stats) / total_gp, 1),
-        "fta": round(sum(s.fta * s.gp for s in stats) / total_gp, 1),
-        "poss100_pts": round(sum(s.poss100_pts * s.gp for s in stats) / total_gp, 1),
-        "poss100_reb": round(sum(s.poss100_reb * s.gp for s in stats) / total_gp, 1),
-        "poss100_ast": round(sum(s.poss100_ast * s.gp for s in stats) / total_gp, 1),
-        "poss100_stl": round(sum(s.poss100_stl * s.gp for s in stats) / total_gp, 1),
-        "poss100_blk": round(sum(s.poss100_blk * s.gp for s in stats) / total_gp, 1),
-        "poss100_tov": round(sum(s.poss100_tov * s.gp for s in stats) / total_gp, 1),
-        "min_per_game": round(sum((s.min_per_game or 0) * s.gp for s in stats) / total_gp, 1),
-    }
+    fields = ("pts", "reb", "ast", "stl", "blk", "tov", "fg_pct", "fg3_pct", "ft_pct", "fga", "fg3a",
+              "fg3m", "fta", "poss100_pts", "poss100_reb", "poss100_ast", "poss100_stl", "poss100_blk",
+              "poss100_tov", "min_per_game")
+    result = {"season_id": "Kariéra"}
+    for field in fields:
+        values = [(getattr(s, field), s.gp) for s in stats if s.gp and getattr(s, field) is not None]
+        result[field] = round(sum(v * n for v, n in values) / sum(n for _, n in values), 3) if values else 0
+    return result
 
 
 @app.post("/api/compare")
@@ -1159,6 +1134,8 @@ def compare_two_players(req: CompareRequest, db: Session = Depends(get_db)):
 
     if cached and cached.ai_verdict:
         ai_verdict = cached.ai_verdict
+    elif source_switch.espn_first():
+        ai_verdict = (unified or {}).get("style_note") or "Shoda vychází z dostupných statistik a herního stylu."
     else:
         ai_verdict = generate_comparison_verdict(
             p1_name=p1.full_name,
@@ -1258,6 +1235,8 @@ def _build_style_profile(player: Player, season: Optional[str] = None) -> Dict[s
     hlavní stránka). Pro konkrétní sezónu dosadí čísla té sezóny do stejného
     profilu – archetyp, styl i postava se pak počítají z ní.
     """
+    if source_switch.espn_first() and not season:
+        return closest_service.prime_for_player(player)
     external = nba_external.career_profile(player.id, player.full_name) or {}
 
     if season and season != "career":
@@ -1426,8 +1405,8 @@ def compare_players_style(req: CompareRequest, db: Session = Depends(get_db)):
             awards_count=len(player.awards or []),
         )
 
-    profile1 = _profile(p1)
-    profile2 = _profile(p2)
+    profile1 = _build_style_profile(p1) if source_switch.espn_first() else _profile(p1)
+    profile2 = _build_style_profile(p2) if source_switch.espn_first() else _profile(p2)
     pair = closest_player.compare_pair(profile1, profile2)
 
     return {

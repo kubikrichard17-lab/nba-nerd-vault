@@ -513,8 +513,14 @@ def _player_from_espn(player_id: int, db: Session) -> Optional[Player]:
     try:
         from . import espn_seasons
 
-        career = espn_seasons.career_stats(player_id)
-        seasons = espn_seasons.player_season_stats(player_id)
+        expected = canonical_name(player_id) or ""
+        espn_id = espn_seasons.resolve_id(player_id, expected)
+        if not espn_id:
+            return None
+        career = espn_seasons.career_stats(player_id, expected, espn_id=espn_id, metadata_only=True)
+        if not career:
+            return None
+        seasons = espn_seasons.player_season_stats(player_id, espn_id=espn_id, allow_legacy=not _nba_is_down())
     except Exception as exc:  # pragma: no cover
         logger.warning("ESPN profil %s selhal: %s", player_id, exc)
         return None
@@ -542,6 +548,10 @@ def _player_from_espn(player_id: int, db: Session) -> Optional[Player]:
         or f"https://cdn.nba.com/headshots/nba/latest/1040x760/{player_id}.png"
     )
     player.is_active = bool(player.is_active)
+    if seasons:
+        from datetime import datetime
+
+        player.updated_at = datetime.utcnow()
 
     # sezóny: stare se smažou jen když přišly nové
     if seasons:
@@ -609,6 +619,15 @@ def fetch_and_cache_player(player_id: int, db: Session) -> Optional[Player]:
     """Load player from SQLite database. If missing, fetch from NBA API and cache."""
     # Check cache first
     existing = db.query(Player).filter(Player.id == player_id).first()
+    if _nba_is_down():
+        from datetime import datetime, timedelta
+
+        expected = canonical_name(player_id)
+        matches = existing and (not expected or existing.full_name.casefold() == expected.casefold())
+        updated = getattr(existing, "updated_at", None)
+        if matches and existing.stats and updated and datetime.utcnow() - updated < timedelta(hours=6):
+            return existing
+        return _player_from_espn(player_id, db) or (existing if matches else None)
     if existing and existing.stats:
         # Data se musí obnovit jen tehdy, když v databázi chybí konec
         # kariéry (např. 15 z 22 sezón). Jinak se nic nestahuje.

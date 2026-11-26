@@ -66,7 +66,8 @@ def _cached(key: str, fn):
     if hit and (datetime.now(timezone.utc).timestamp() - hit[0]) < _CACHE_TTL:
         return hit[1]
     value = fn()
-    _CACHE[key] = (datetime.now(timezone.utc).timestamp(), value)
+    if value is not None:
+        _CACHE[key] = (datetime.now(timezone.utc).timestamp(), value)
     return value
 
 
@@ -181,18 +182,32 @@ def _is_espn_id(value: int) -> bool:
     return bool(payload.get("fullName"))
 
 
-def resolve_id(nba_id: int) -> int:
+# Čísla, o kterých aplikace ví, že jsou už ESPN ID (legendy v seznamu
+# kandidátů). Ta se nepřekládají – jinak by se ESPN 1035 (Jordan) bralo
+# jako NBA číslo a přeložilo na jiného hráče.
+KNOWN_ESPN_IDS: set = set()
+
+
+def mark_espn_ids(ids) -> None:
+    """Zapamatuje si čísla, která pocházejí přímo z ESPN."""
+    for value in ids or []:
+        try:
+            KNOWN_ESPN_IDS.add(int(value))
+        except (TypeError, ValueError):
+            continue
+
+
+def resolve_id(nba_id: int, name: str = "") -> Optional[int]:
     """
     Přeloží NBA ID hráče na ID v ESPN (jsou jiná: LeBron 2544 → 1966).
 
     Jméno se vezme z registru NBA a dohledá přes vyhledávání ESPN;
     bere se jen přesná shoda jména v NBA. Když se nenajde, vrátí původní ID.
     """
-    def _do() -> int:
-        # Už je to ESPN ID? (Jordan 1035, Kobe 110) – pak se nepřekládá.
-        if _is_espn_id(int(nba_id)):
-            return int(nba_id)
+    if name:
+        return search_athlete(name)
 
+    def _do() -> int:
         name = None
         try:
             from nba_api.stats.static import players
@@ -214,7 +229,17 @@ def resolve_id(nba_id: int) -> int:
             except Exception:
                 name = None
         if not name or str(name).isdigit():
+            return int(nba_id) if _is_espn_id(nba_id) else None
+
+        # Stejné číslo může v ESPN patřit jinému sportovci (NBA 893 Jordan =
+        # ESPN 893 Jameel Watkins). ESPN ID se bere jen při shodě jména.
+        payload = _get_json(f"{ESPN_BASE}/athletes/{int(nba_id)}") or {}
+        if payload.get("fullName") and _plain(payload["fullName"]) == _plain(name):
             return int(nba_id)
+
+        found = search_athlete(str(name))
+        if found:
+            return int(found)
         from urllib.parse import quote
 
         data = _get_json(
@@ -230,7 +255,7 @@ def resolve_id(nba_id: int) -> int:
                 m = re.search(r"a:(\d+)", str(item.get("uid", "")))
                 if m:
                     return int(m.group(1))
-        return int(nba_id)
+        return None
 
     return _cached(f"resolve:{nba_id}", _do)
 
@@ -268,7 +293,7 @@ def search_athlete(name: str) -> Optional[int]:
                     continue
                 espn_id = int(m.group(1))
                 payload = _get_json(f"{ESPN_BASE}/athletes/{espn_id}") or {}
-                if payload.get("fullName") and _plain(payload["fullName"]) != wanted:
+                if _plain(payload.get("fullName") or payload.get("displayName") or "") != wanted:
                     continue
                 if not (payload.get("statisticslog") or payload.get("statistics")):
                     continue
@@ -278,13 +303,78 @@ def search_athlete(name: str) -> Optional[int]:
     return _cached(f"search:{wanted}", _do)
 
 
-def player_season_stats(player_id: int) -> Optional[List[Dict[str, Any]]]:
+_AVERAGE_FIELDS = {**STAT_MAP, "fieldGoalPct": "fg_pct",
+                   "threePointFieldGoalPct": "fg3_pct", "freeThrowPct": "ft_pct"}
+
+
+def _compact_seasons(data: Dict[str, Any]) -> List[Dict[str, Any]]:
+    averages = next((c for c in data.get("categories", []) if c.get("name") == "averages"), {})
+    teams = data.get("teams") or {}
+    grouped: Dict[str, list] = {}
+    for entry in averages.get("statistics", []):
+        season = _season_from_year((entry.get("season") or {}).get("year"))
+        if not season:
+            continue
+        row: Dict[str, Any] = {"season_id": season, "team_abbreviation":
+                              (teams.get(entry.get("teamSlug")) or {}).get("abbreviation") or ""}
+        for key, raw in zip(averages.get("names", []), entry.get("stats", [])):
+            parts = key.split("-")
+            if len(parts) == 2 and all(p in _AVERAGE_FIELDS for p in parts):
+                pair = str(raw).split("-", 1)
+                if len(pair) == 2:
+                    for part, value in zip(parts, pair):
+                        row[_AVERAGE_FIELDS[part]] = _num(value, None)
+            elif key in _AVERAGE_FIELDS:
+                field = _AVERAGE_FIELDS[key]
+                value = _num(raw, None)
+                row[field] = value / 100 if value is not None and field.endswith("_pct") else value
+        if row.get("gp") and row.get("pts") is not None:
+            grouped.setdefault(season, []).append(row)
+    rows = []
+    for season, entries in sorted(grouped.items()):
+        combined = next((r for r in entries if r["team_abbreviation"] in {"", "TOT"}), None)
+        if len(entries) == 1 or combined:
+            rows.append(combined or entries[0])
+            continue
+        row = {"season_id": season, "team_abbreviation": "TOT", "gp": sum(r["gp"] for r in entries)}
+        for field in set().union(*(r.keys() for r in entries)) - set(row):
+            values = [(r[field], r["gp"]) for r in entries if r.get(field) is not None]
+            if values:
+                row[field] = sum(v for v, _ in values) if field == "gs" else sum(v * n for v, n in values) / sum(n for _, n in values)
+        for pct, made, attempts in (("fg_pct", "fgm", "fga"), ("fg3_pct", "fg3m", "fg3a"), ("ft_pct", "ftm", "fta")):
+            if row.get(attempts) and row.get(made) is not None:
+                row[pct] = row[made] / row[attempts]
+        rows.append(row)
+    return rows
+
+
+def player_season_stats(player_id: int, *, name: str = "", espn_id: Optional[int] = None,
+                        allow_legacy: bool = True) -> Optional[List[Dict[str, Any]]]:
     """
     Všechny sezóny hráče podle ESPN, ve tvaru jako z nba_api.
 
     Vrací None, když ESPN hráče nezná. Pořadí je od nejstarší sezóny.
     """
-    player_id = resolve_id(player_id)
+    player_id = espn_id if espn_id is not None else resolve_id(player_id, name)
+    if not player_id:
+        return None
+    from services import nba_external
+
+    key = f"espn-summary:v1:{player_id}"
+    cached = nba_external._cache_get(key, 6 * 3600)
+    if cached:
+        return cached
+    summary = _get_json(
+        "https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/"
+        f"athletes/{player_id}/stats?seasontype=2"
+    )
+    rows = _compact_seasons(summary or {})
+    if rows:
+        nba_external._cache_set(key, rows)
+        return rows
+    stale = nba_external._cache_get(key, nba_external.TTL_PROFILE)
+    if stale or not allow_legacy:
+        return stale
 
     def load() -> Optional[List[Dict[str, Any]]]:
         log = _get_json(f"{ESPN_BASE}/athletes/{player_id}/statisticslog")
@@ -334,7 +424,8 @@ def player_season_stats(player_id: int) -> Optional[List[Dict[str, Any]]]:
     return _cached(f"seasons:{player_id}", load)
 
 
-def career_stats(player_id: int, name: str = "") -> Optional[Dict[str, Any]]:
+def career_stats(player_id: int, name: str = "", *, espn_id: Optional[int] = None,
+                 metadata_only: bool = False) -> Optional[Dict[str, Any]]:
     """
     Kariérní průměry hráče podle ESPN (jeden dotaz).
 
@@ -342,8 +433,10 @@ def career_stats(player_id: int, name: str = "") -> Optional[Dict[str, Any]]:
     nestačí. Vrací i pozici a míry, protože je má ve stejném dokumentu.
     `name` slouží k ověření, že profil v ESPN opravdu patří tomuhle hráči.
     """
-    player_id = resolve_id(player_id)
-    wanted = _plain(name)
+    player_id = espn_id if espn_id is not None else resolve_id(player_id, name)
+    if not player_id:
+        return None
+    wanted = _plain(name) if name else ""
 
     def load() -> Optional[Dict[str, Any]]:
         data = _get_json(f"{ESPN_BASE}/athletes/{player_id}")
@@ -363,7 +456,7 @@ def career_stats(player_id: int, name: str = "") -> Optional[Dict[str, Any]]:
         # kariérní statistiky jsou odkaz v `statistics`
         values: Dict[str, Any] = {}
         stat_ref = ((data.get("statistics") or {}).get("$ref")) or ""
-        if stat_ref:
+        if stat_ref and not metadata_only:
             values = _split_stats(stat_ref)
 
         row = _to_row("career", values) if values else None
@@ -381,7 +474,7 @@ def career_stats(player_id: int, name: str = "") -> Optional[Dict[str, Any]]:
             row["weight_kg"] = round(weight_lb * 0.45359237, 1)
         return row if row.get("gp") or row.get("name") else None
 
-    return _cached(f"career:{player_id}", load)
+    return _cached(f"career:{player_id}:{wanted}:{metadata_only}", load)
 
 
 GAMELOG_URL = (

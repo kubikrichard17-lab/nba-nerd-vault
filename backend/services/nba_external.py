@@ -22,6 +22,7 @@ import logging
 import os
 import re
 import threading
+import tempfile
 import time
 import unicodedata
 import urllib.parse
@@ -73,11 +74,18 @@ def _load_memory() -> Dict[str, Any]:
 
 
 def _save_memory(payload: Dict[str, Any]) -> None:
+    tmp = None
     try:
-        with gzip.open(CACHE_PATH, "wt", encoding="utf-8") as fh:
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CACHE_PATH))
+        os.close(fd)
+        with gzip.open(tmp, "wt", encoding="utf-8") as fh:
             json.dump(payload, fh, ensure_ascii=False)
+        os.replace(tmp, CACHE_PATH)
     except Exception as exc:  # pragma: no cover
         logger.warning("Paměť externích dat se nepodařilo uložit: %s", exc)
+    finally:
+        if tmp and os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def _cache_get(key: str, ttl: int) -> Optional[Any]:
@@ -98,16 +106,16 @@ def _cache_set(key: str, value: Any) -> None:
     Zapíše odpověď do paměti. Na disk se ukládá jen občas – jinak by
     každé uložení zdržovalo požadavek.
     """
-    payload = _load_memory()
-    payload["entries"][key] = {"t": _now(), "v": value}
-    _DIRTY["count"] += 1
-    if len(payload["entries"]) > 6000:
-        cutoff = _now() - TTL_PROFILE
-        payload["entries"] = {
-            k: v for k, v in payload["entries"].items() if v.get("t", 0) >= cutoff
-        }
-    if _DIRTY["count"] % 40 == 0:
-        with _LOCK:
+    with _LOCK:
+        payload = _load_memory()
+        payload["entries"][key] = {"t": _now(), "v": value}
+        _DIRTY["count"] += 1
+        if len(payload["entries"]) > 6000:
+            cutoff = _now() - TTL_PROFILE
+            payload["entries"] = {
+                k: v for k, v in payload["entries"].items() if v.get("t", 0) >= cutoff
+            }
+        if _DIRTY["count"] % 40 == 0:
             _save_memory(payload)
 
 
@@ -984,20 +992,6 @@ def _name_for(player_id: int) -> str:
     nedalo přeložit ESPN ID a hráč by „zmizel".
     """
     try:
-        import models
-        from database import SessionLocal
-
-        session = SessionLocal()
-        try:
-            row = session.query(models.Player).filter(models.Player.id == player_id).first()
-            if row is not None and row.full_name:
-                return str(row.full_name)
-        finally:
-            session.close()
-    except Exception:
-        pass
-
-    try:
         from nba_api.stats.static import players as nba_players
 
         for info in nba_players.get_players():
@@ -1014,6 +1008,22 @@ def _name_for(player_id: int) -> str:
     size = _cache_get(f"size:{player_id}", TTL_PROFILE) or {}
     if size.get("name"):
         return str(size["name"])
+
+    # Databáze až nakonec – mohla mít pod NBA číslem cizí jméno z ESPN.
+    try:
+        import models
+        from database import SessionLocal
+
+        session = SessionLocal()
+        try:
+            row = session.query(models.Player).filter(models.Player.id == player_id).first()
+            if row is not None and row.full_name:
+                return str(row.full_name)
+        finally:
+            session.close()
+    except Exception:
+        pass
+
     return str(player_id)
 
 
@@ -1382,6 +1392,23 @@ def _espn_all_players(season: str) -> List[Dict[str, Any]]:
     return rows
 
 
+def cached_comparison_rows() -> List[Dict[str, Any]]:
+    """Externí data dostupná hned; žádné hromadné dotazy při otevření hráče."""
+    entries = list(_load_memory()["entries"].items())
+    by_name: Dict[str, Dict[str, Any]] = {}
+    league = sorted((k for k, _ in entries if k.startswith("league:")), reverse=True)
+    sets = [_cache_get(k, TTL_PROFILE) or [] for k in league]
+    sets.append([dict(e["v"], id=int(k.split(":", 1)[1])) for k, e in entries
+                 if k.startswith("nba:") and _now() - e.get("t", 0) <= TTL_PROFILE
+                 and e["v"].get("gp") and e["v"].get("name") and not e["v"].get("season")])
+    for rows in sets:
+        for row in rows:
+            key = normalize_name(row.get("name") or "")
+            if key and _num(row.get("gp")) >= 10:
+                by_name[key] = row
+    return list(by_name.values())
+
+
 def _all_player_pool() -> List[Dict[str, Any]]:
     """
     Nabídka kandidátů pro „nejbližšího hráče" = všichni hráči z ESPN
@@ -1393,6 +1420,7 @@ def _all_player_pool() -> List[Dict[str, Any]]:
     key = "allpool"
     cached = _cache_get(key, TTL_STATS)
     if cached is not None:
+        _mark_pool_espn(cached or [])
         return cached or []
 
     by_id: Dict[int, Dict[str, Any]] = {}
@@ -1450,10 +1478,24 @@ def _all_player_pool() -> List[Dict[str, Any]]:
         by_id[pid] = dict(row)
 
     pool = _link_nba_ids(list(by_id.values()))
+    _mark_pool_espn(pool)
     if pool:
         _cache_set(key, pool)
     logger.info("Nabídka hráčů pro nejbližšího hráče: %d", len(pool))
     return pool
+
+
+def _mark_pool_espn(rows: List[Dict[str, Any]]) -> None:
+    """Řádky, které si nechaly ESPN číslo, se označí – nepřekládají se."""
+    try:
+        from services import espn_seasons
+
+        espn_seasons.mark_espn_ids(
+            int(r["id"]) for r in rows
+            if r.get("espn_id") and int(r.get("espn_id") or 0) == int(r.get("id") or -1)
+        )
+    except Exception:  # pragma: no cover
+        pass
 
 
 def _link_nba_ids(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:

@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 from services import defense
 
 # Když se změní prompt nebo logika, zvyš číslo – stará cache se přestane používat.
-ENGINE_VERSION = 25
+ENGINE_VERSION = 28
 
 # Kolik kandidátů se AI pošle (víc = horší soustředění, méně = může chybět správný)
 CANDIDATE_LIMIT = 12
@@ -100,6 +100,10 @@ def coerce_position(value: Optional[str], height_cm: float = 198.0) -> str:
     if "power forward" in joined:
         return "PF"
 
+    if text == "g":
+        return "PG" if height < 191 else "SG"
+    if text == "f":
+        return "PF" if height >= 206 else "SF"
     if "guard" in tokens and "forward" in tokens:
         return "SG" if height < 201 else "SF"
     if "guard" in tokens:
@@ -332,6 +336,8 @@ def archetype(p: Dict[str, Any]) -> str:
         return "stretch_big"             # Dirk, Markkanen – vysoký střelec, málo asistencí
 
     if group == "guard":
+        if pos == "PG" and pts >= 22.0 and ast >= 5.0 and fg3m < 2.0:
+            return "scoring_pg"
         # Kdo má v ruce míč a tvoří (7+ asistencí) s velkým objemem bodů,
         # je tvůrce hry – Harden, Cade, Luka, Westbrook. Ne čisté SG.
         # Pozor: Jordan (1988) měl 8 asistencí a 8 doskoků, ale tvořil
@@ -574,10 +580,16 @@ def build_profile(
     )
     ath_score = defense.athleticism_score(ft_rate, shot_profile["two_rate"], stocks100)
     gravity = defense.shooting_gravity(fg3m, fg3a, fg3_pct)
+    pos_type = position_type(position, height_cm)
+    # Obecné G neurčuje roli. U produktivního guarda zohledni tempo,
+    # tvorbu pro spoluhráče i ztráty, nikoli jen jeho výšku.
+    if (_norm(position) in {"g", "guard"} and ast >= 5.0 and (ast100 or 0) >= 8.0
+            and tov > 0 and ast >= 2.0 * tov and ast > reb):
+        pos_type = "PG"
     profile = {
         "role_group": group,
         "height_cm": _num(height_cm, 198.0),
-        "position_type": position_type(position, height_cm),
+        "position_type": pos_type,
         "pts": pts,
         "ast": ast,
         "reb": reb,
@@ -606,6 +618,7 @@ def build_profile(
 
     return {
         "id": player_id,
+        "espn_id": stat.get("espn_id"),
         "name": name,
         "position": position or "",
         "height_cm": _num(height_cm, 198.0),
@@ -638,8 +651,8 @@ def build_profile(
         "scoring_mode": profile["scoring_mode"],
         "role_group": group,
         "role_label": ROLE_GROUP_LABEL[group],
-        "position_type": position_type(position, height_cm),
-        "position_label": POSITION_LABEL[position_type(position, height_cm)],
+        "position_type": pos_type,
+        "position_label": POSITION_LABEL[pos_type],
         "archetype": arch,
         "archetype_label": ARCHETYPE_LABEL[arch],
         "scoring_mode": scoring_mode(profile),
@@ -745,12 +758,15 @@ def _similarity(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, float]:
     except Exception:  # pragma: no cover
         pass
 
-    total = _clamp(total)
+    if a.get("role_group") != b.get("role_group"):
+        total -= 12.0
+    if a.get("position_type") != b.get("position_type"):
+        total -= 4.0
     return {
-        "match_pct": total,
-        "style_pct": style_pct,
-        "physical_pct": physical_pct,
-        "stats_pct": stats_pct,
+        "match_pct": round(_clamp(total), 1),
+        "style_pct": round(style_pct, 1),
+        "physical_pct": round(physical_pct, 1),
+        "stats_pct": round(stats_pct, 1),
     }
 
 
@@ -832,6 +848,7 @@ def _stats_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
         ("ts", 100.0),
     ]
     diffs: List[float] = []
+    total_weight = 0.0
     for key, weight in pairs:
         va = _num(a.get(key))
         vb = _num(b.get(key))
@@ -839,10 +856,11 @@ def _stats_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
             continue
         base = max((va + vb) / 2.0, 0.35 if key not in ("pts", "reb", "ast") else 1.0)
         diffs.append(min(abs(va - vb) / base, 1.0) * weight)
+        total_weight += weight
 
     if not diffs:
         return 50.0
-    penalty = sum(diffs) / sum(w for _, w in pairs[: len(diffs)]) if diffs else 0.0
+    penalty = sum(diffs) / total_weight
     return _clamp(100.0 - penalty * 100.0)
 
 
@@ -1328,6 +1346,9 @@ _LAST_AI: Dict[str, Dict[str, Any]] = {}
 _LAST_AI_LIMIT = 200
 
 
+_AI_DOWN_UNTIL = 0.0
+
+
 def _call_gemini_json(
     prompt: str, system: Optional[str] = None
 ) -> Optional[Dict[str, Any]]:
@@ -1343,9 +1364,18 @@ def _call_gemini_json(
         logger.warning("Knihovna google-genai není k dispozici: %s", exc)
         return None
 
+    global _AI_DOWN_UNTIL
+    import time as _time
+
+    cached_answer = _LAST_AI.get(prompt)
+    if _time.time() < _AI_DOWN_UNTIL:
+        # Kvóta je vyčerpaná – nečeká se na čtyři modely po 15 s.
+        return cached_answer
+
     forced = os.environ.get("GEMINI_MODEL")
     models = [forced] if forced else GEMINI_MODELS
     last_error = ""
+    quota_errors = 0
 
     for model in models:
         try:
@@ -1376,8 +1406,13 @@ def _call_gemini_json(
                 return data
         except Exception as exc:  # pragma: no cover
             last_error = str(exc)[:160]
+            if "429" in last_error or "RESOURCE_EXHAUSTED" in last_error:
+                quota_errors += 1
             logger.info("Model %s neodpověděl: %s", model, last_error)
             continue
+
+    if quota_errors:
+        _AI_DOWN_UNTIL = _time.time() + 15 * 60
 
     cached = _LAST_AI.get(prompt)
     if cached:
@@ -1511,6 +1546,41 @@ def enrich_awards(target: Dict[str, Any], candidates: List[Dict[str, Any]]) -> L
     return out or candidates
 
 
+def resolve_cached(target: Dict[str, Any], pool: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Pořadí podle role a střelby, uvnitř nejbližší skupiny podle shody."""
+    if not target.get("pts"):
+        return None
+    from services.nba_external import normalize_name
+
+    name = normalize_name(target["name"])
+    candidates = [c for c in pool if c["id"] != target["id"] and c["pts"] > 0
+                  and normalize_name(c["name"]) != name
+                  and (target["role_group"] == "big") == (c["role_group"] == "big")
+                  and abs(target["height_cm"] - c["height_cm"]) <= 12
+                  and min(c["pts"], target["pts"]) / max(c["pts"], target["pts"]) >= 0.65
+                  and abs(three_share(target) - three_share(c)) <= 0.25]
+    if not candidates:
+        return None
+    ranked = sorted(candidates, key=lambda c: (-_similarity(target, c)["match_pct"], c["id"]))
+    chosen = ranked[0]
+    sim = _similarity(target, chosen)
+    texts = _fallback_texts(target, chosen)
+    return {
+        "engine_version": ENGINE_VERSION,
+        "player_id": target["id"], "player_name": target["name"],
+        "player_role": target["role_label"], "player_tier": target["tier_label"],
+        "closest": {"id": chosen["id"], "full_name": chosen["name"],
+                    "position": chosen["position"], "role_label": chosen["role_label"], **sim},
+        "top_3_candidates": [{"id": c["id"], "name": c["name"], "why": _fallback_why(target, c)} for c in ranked[:3]],
+        "match_percentage": sim["match_pct"],
+        "reasoning": _fallback_reasoning(target), **texts,
+        "breakdown": {"herni_styl": texts["style_comparison"], "fyzicko": texts["physical_comparison"],
+                      "statisticky_dopad": texts["stats_comparison"]},
+        "ai_used": False, "two_phase": False,
+        "generated_at": datetime.utcnow().isoformat(),
+    }
+
+
 def resolve(
     target: Dict[str, Any],
     pool: List[Dict[str, Any]],
@@ -1607,7 +1677,9 @@ def resolve(
         # nepřesáhne 40 %, je to špatný návrh a rozhodne předvýběr.
         if max(_similarity(target, c)["match_pct"] for c in candidates) < 40.0:
             logger.info("Nejbližší hráč: návrhy AI mají nízkou shodu, bere se předvýběr")
-            suggested_mode = False
+            # Volba AI z takových návrhů se nesmí použít (Jordan dostal
+            # Amena Thompsona s 28 %) – rozhoduje celý seznam kandidátů.
+            return resolve(target, pool, use_ai=False)
 
     if suggested_mode and len(candidates) < 2:
         # Z návrhů zbyl jediný kandidát – s jedním se nedá vybírat, takže
@@ -1627,6 +1699,18 @@ def resolve(
             best = resolve(target, pool, use_ai=False)
             if best and best["closest"]["match_pct"] >= _similarity(target, ranked[0])["match_pct"]:
                 return best
+
+    if chosen is not None and not suggested_mode:
+        # AI smí vybrat jen z pěti nejlepších podle předvýběru (role a
+        # archetyp). Jinak výsledek závisel na tom, zda Gemini odpověděla:
+        # Jordan jednou Wade, jindy Amen Thompson s 28 %.
+        head_ids = {
+            c["id"] for c in [x for x in candidates if x["id"] != target["id"]][:5]
+        }
+        if chosen["id"] not in head_ids:
+            chosen = None
+            ai = None
+            top_three = []
 
     if chosen is None:
         # Bez AI rozhoduje pořadí předvýběru: nejdřív se hledá mezi hráči,
@@ -1665,8 +1749,13 @@ def resolve(
     # se nic nenačetlo. Když ho AI nedodala, odvodí se z čísel.
     if not top_three:
         top_three = [{"id": c["id"], "name": c["name"], "why": ""} for c in candidates[:3]]
+    by_cand_id = {c["id"]: c for c in candidates}
     top_three = [
-        dict(c, why=(c.get("why") or "").strip() or _fallback_why(target, c))
+        dict(
+            c,
+            why=(c.get("why") or "").strip()
+            or (_fallback_why(target, by_cand_id[c["id"]]) if c.get("id") in by_cand_id else ""),
+        )
         for c in top_three
     ]
 

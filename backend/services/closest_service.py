@@ -106,6 +106,7 @@ def _find_player(name: str) -> Tuple[Optional[int], str]:
     except Exception as exc:  # pragma: no cover
         logger.warning("Hráče %s nešlo najít v databázi: %s", name, exc)
 
+    # Registr NBA (lokálně) – v cloudu je nedostupný, proto se zkouší dál.
     try:
         from nba_api.stats.static import players as nba_players
 
@@ -115,6 +116,16 @@ def _find_player(name: str) -> Tuple[Optional[int], str]:
             return int(exact[0]["id"]), exact[0]["full_name"]
     except Exception:
         pass
+
+    # ESPN podle jména – jediná cesta, jak na serveru najít legendu.
+    try:
+        from services import espn_seasons
+
+        espn_id = espn_seasons.search_athlete(name)
+        if espn_id:
+            return int(espn_id), name
+    except Exception as exc:  # pragma: no cover
+        logger.warning("Hráče %s nešlo najít v ESPN: %s", name, exc)
     return None, name
 
 
@@ -206,8 +217,74 @@ def _suggested(profile: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [p for p in found if p]
 
 
+def comparison_dimensions(player_id, position, height, weight):
+    known = nba_external._cache_get(f"nbainfo:{player_id}", nba_external.TTL_PROFILE) or {}
+    return (known.get("position") or position, known.get("height_cm") or height,
+            known.get("weight_kg") or weight)
+
+
+def prime_for_player(player):
+    from services.career_phases import _blend, prime_window
+
+    rows = season_rows(player)
+    pos, height, weight = comparison_dimensions(player.id, player.position, player.height_cm, player.weight_kg)
+    return closest_player.build_profile(player.id, player.full_name, pos, height, weight, _blend(prime_window(rows)))
+
+
+def _refine_candidates(target, pool):
+    """Na vyžádání ověří vrchol krátkého výběru, paralelně a jednou pro všechny fáze."""
+    from concurrent.futures import ThreadPoolExecutor
+    from services import espn_seasons
+    from services.career_phases import _blend, prime_window
+
+    shortlist = closest_player.preselect(target, pool, limit=6)
+    # Kariérní průměr může skrýt vrchol (zejména u dlouhých kariér).
+    # Část výběru proto rezervujeme hráčům ze stejné role a s podobnou postavou.
+    names = {nba_external.normalize_name(c["name"]) for c in [target, *shortlist]}
+    same_role = sorted(
+        (c for c in pool if c["role_group"] == target["role_group"]
+         and c["pts"] >= max(2, target["pts"] * 0.62)
+         and abs(c["height_cm"] - target["height_cm"]) <= 10
+         and nba_external.normalize_name(c["name"]) not in names),
+        key=lambda c: (c["archetype"] != target["archetype"],
+                       abs(c["height_cm"] - target["height_cm"]) * 0.25 + abs(c["pts"] - target["pts"]),
+                       c["id"]),
+    )
+    shortlist.extend(same_role[:4])
+    names.update(nba_external.normalize_name(c["name"]) for c in shortlist)
+    # Doplň i historické profily, kde v souhrnu může chybět přesná pozice.
+    established = sorted(
+        (c for c in pool if nba_external.normalize_name(c["name"]) not in names
+         and c["pts"] >= target["pts"] * 0.58
+         and abs(c["height_cm"] - target["height_cm"]) <= 8),
+        key=lambda c: (abs(c["pts"] - target["pts"]) + abs(c["height_cm"] - target["height_cm"]) * 0.35,
+                       c["id"]),
+    )
+    shortlist.extend(established[:4])
+    def refine(candidate):
+        rows = espn_seasons.player_season_stats(candidate["id"], name=candidate["name"],
+                                                espn_id=candidate.get("espn_id"), allow_legacy=False)
+        if not rows:
+            return candidate
+        stat = _blend(prime_window(rows))
+        pos, height, weight = comparison_dimensions(candidate["id"], candidate["position"],
+                                                     candidate["height_cm"], candidate["weight_kg"])
+        profile = closest_player.build_profile(candidate["id"], candidate["name"], pos, height, weight, stat)
+        return profile
+
+    with ThreadPoolExecutor(max_workers=14) as executor:
+        refined = list(executor.map(refine, shortlist))
+    resolved = [c for original, c in zip(shortlist, refined) if c is not original]
+    return resolved
+
+
 def _resolve_for(profile: Dict[str, Any], pool: List[Dict[str, Any]], label: str) -> Optional[Dict[str, Any]]:
     """Jedno volání modelu pro danou verzi hráče."""
+    if nba_external.source_switch.espn_first():
+        result = closest_player.resolve_cached(profile, pool)
+        if result:
+            result["basis"] = label
+        return result
     suggested = _suggested(profile)
     # Diagnostika pro log serveru – z kolika návrhů se opravdu počítalo.
     logger.info(
@@ -248,18 +325,25 @@ def build_closest_payload(
       career_phases                    – [{key, label, closest, …}, …]
       evolution_note                   – co se konkrétně změnilo
     """
-    external = nba_external.career_profile(player.id, player.full_name) or {}
-    position = external.get("position") or player.position
-    height_cm = external.get("height_cm") or player.height_cm
-    weight_kg = external.get("weight_kg") or player.weight_kg
-    awards = len(player.awards or [])
+    rows = season_rows(player)
+    if nba_external.source_switch.espn_first() and not rows:
+        return None
+    external = ({} if rows else nba_external.career_profile(player.id, player.full_name) or {})
+    position, height_cm, weight_kg = comparison_dimensions(
+        player.id, external.get("position") or player.position,
+        external.get("height_cm") or player.height_cm, external.get("weight_kg") or player.weight_kg
+    )
+    awards = 0 if nba_external.source_switch.espn_first() else len(player.awards or [])
 
-    career_stat = dict(external) if external else {}
+    from services.career_phases import _blend
+
+    career_stat = _blend(rows) if rows else dict(external)
     if external:
         # Kariéra se pamatuje (dočasně) – slouží i jako kandidát pro
         # ostatní hráče, takže legenda mimo sezónní tabulku nezmizí.
         nba_external.remember_career(player.id, player.full_name, external)
-    award_detail = closest_player.defense.award_profile(player.id)
+    award_detail = (closest_player.defense.empty_awards() if nba_external.source_switch.espn_first()
+                    else closest_player.defense.award_profile(player.id))
     base = closest_player.build_profile(
         player_id=player.id,
         name=player.full_name,
@@ -271,9 +355,14 @@ def build_closest_payload(
         award_detail=award_detail,
     )
 
-    phases = career_phases(season_rows(player), base, closest_player.build_profile)
+    phases = career_phases(rows, base, closest_player.build_profile)
     prime = phases.get("prime") or {}
-    prime_profile = closest_player.apply_awards(prime.get("profile") or base, award_detail)
+    prime_profile = prime.get("profile") or base
+    if nba_external.source_switch.espn_first():
+        prime_profile = prime_for_player(player)
+        pool = _refine_candidates(prime_profile, pool)
+    else:
+        closest_player.apply_awards(prime_profile, award_detail)
 
     # 1) Prime – výchozí srovnání
     result = _resolve_for(prime_profile, pool, "prime")
