@@ -335,7 +335,10 @@ def ensure_correct_name(player: Player, db: Session) -> Player:
 
 def search_players_service(query: str, db: Session, limit: int = 15) -> List[Dict[str, Any]]:
     """Search players in SQLite cache first, then in nba_api static registry."""
+    from services.nba_external import normalize_name
+
     clean_query = query.strip().lower()
+    normalized = normalize_name(clean_query)
     if not clean_query:
         # Return popular seeded players
         db_popular = db.query(Player).order_by(Player.full_name).limit(limit).all()
@@ -363,7 +366,7 @@ def search_players_service(query: str, db: Session, limit: int = 15) -> List[Dic
     # a našli se jen novější hráči se jménem Jordan.
     static_players = get_static_players_list()
     for sp in static_players:
-        if clean_query in sp["full_name"].lower():
+        if normalized and normalized in normalize_name(sp["full_name"]):
             if sp["id"] not in seen_ids:
                 results.append({
                     "id": sp["id"],
@@ -376,7 +379,7 @@ def search_players_service(query: str, db: Session, limit: int = 15) -> List[Dic
                 seen_ids.add(sp["id"])
 
     # přesná shoda jména nahoru – kdo hledá „jordan", chce Michaela Jordana
-    results.sort(key=lambda r: (r["full_name"].lower() != clean_query, not r.get("in_db"), r["full_name"]))
+    results.sort(key=lambda r: (normalize_name(r["full_name"]) != normalized, not r.get("in_db"), r["full_name"]))
 
     return results
 
@@ -627,10 +630,14 @@ def fetch_and_cache_player(player_id: int, db: Session) -> Optional[Player]:
     if _nba_is_down():
         from datetime import datetime, timedelta
 
+        from services.nba_external import normalize_name
+
         expected = canonical_name(player_id)
-        matches = existing and (not expected or existing.full_name.casefold() == expected.casefold())
+        matches = existing and (not expected or normalize_name(existing.full_name) == normalize_name(expected))
         updated = getattr(existing, "updated_at", None)
-        if matches and existing.stats and updated and datetime.utcnow() - updated < timedelta(hours=6):
+        if matches and existing.stats and (not existing.is_active or (
+            updated and datetime.utcnow() - updated < timedelta(hours=6)
+        )):
             return existing
         return _player_from_espn(player_id, db) or (existing if matches else None)
     if existing and existing.stats:

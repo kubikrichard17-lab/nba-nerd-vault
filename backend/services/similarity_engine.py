@@ -133,23 +133,22 @@ def compute_statistical_match(s1: Dict[str, Any], s2: Dict[str, Any]) -> float:
     return round(max(10.0, min(99.5, score)), 1)
 
 
-def calculate_radar_dimensions(stat: Dict[str, Any], height_cm: float, weight_kg: float) -> Dict[str, float]:
+def calculate_radar_dimensions(stat: Dict[str, Any], height_cm: float, weight_kg: float) -> Dict[str, Optional[float]]:
     """Calculate 7 standardized dimensions (0-100) for CompareRadar overlay chart."""
     # Odhad držení míče na zápas, když zdroj neposílá metriky na 100 držení
     minutes = float(stat.get("min_per_game") or 32.0) or 32.0
     pace = (minutes / 48.0) * 100.0
     pace = max(pace, 30.0)
 
-    pts100 = float(stat.get("poss100_pts") or (float(stat.get("pts", 0)) / pace * 100.0))
-    stat = dict(stat)
-    stat.setdefault("poss100_reb", float(stat.get("reb", 0)) / pace * 100.0)
-    stat.setdefault("poss100_ast", float(stat.get("ast", 0)) / pace * 100.0)
-    stat.setdefault("poss100_stl", float(stat.get("stl", 0)) / pace * 100.0)
-    stat.setdefault("poss100_blk", float(stat.get("blk", 0)) / pace * 100.0)
-    reb100 = float(stat.get("poss100_reb") or (float(stat.get("reb", 0)) / pace * 100.0))
-    ast100 = float(stat.get("poss100_ast") or (float(stat.get("ast", 0)) / pace * 100.0))
-    stl100 = float(stat.get("poss100_stl") or (float(stat.get("stl", 0)) / pace * 100.0))
-    blk100 = float(stat.get("poss100_blk") or (float(stat.get("blk", 0)) / pace * 100.0))
+    from services.defense import optional_number
+
+    def rate(key):
+        measured = optional_number(stat.get("poss100_" + key))
+        raw = optional_number(stat.get(key))
+        return measured if measured is not None else raw / pace * 100 if raw is not None else None
+
+    pts100, reb100, ast100 = (rate(key) or 0. for key in ("pts", "reb", "ast"))
+    stl100, blk100 = rate("stl"), rate("blk")
 
     fg_pct = float(stat.get("fg_pct") or 0.45)
     fg3_pct = float(stat.get("fg3_pct") or 0.0)
@@ -171,8 +170,8 @@ def calculate_radar_dimensions(stat: Dict[str, Any], height_cm: float, weight_kg
     rebounding = min(100.0, (reb100 / 18.0) * 100.0)
 
     # 5. Obrana (0-100) - stocks (steals + blocks per 100)
-    stocks = stl100 * 1.2 + blk100 * 1.3
-    defense = min(100.0, (stocks / 6.0) * 100.0)
+    stocks = sum(v * w for v, w in ((stl100, 1.2), (blk100, 1.3)) if v is not None)
+    defense = min(100., stocks / 6. * 100) if stl100 is not None or blk100 is not None else None
 
     # 6. Efektivita střelby (0-100) - True shooting estimate
     ts_est = fg_pct * 0.5 + ft_pct * 0.3 + fg3_pct * 0.2
@@ -186,7 +185,7 @@ def calculate_radar_dimensions(stat: Dict[str, Any], height_cm: float, weight_kg
         "3B Střelba": round(shooting_3p, 1),
         "Tvorba hry": round(playmaking, 1),
         "Doskakování": round(rebounding, 1),
-        "Obrana": round(defense, 1),
+        "Obrana": round(defense, 1) if defense is not None else None,
         "Efektivita": round(efficiency, 1),
         "Fyzická dominance": round(bmi_score, 1),
     }

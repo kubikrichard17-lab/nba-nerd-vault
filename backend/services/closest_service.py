@@ -188,9 +188,9 @@ def build_closest_payload(player, db, raw_pool):
         profiles = []
         for other, metadata, peak in roster:
             career = metadata[1]
-            if abs(career["height_cm"] - target["height_cm"]) > 12:
+            if not closest_player.compatible_dimensions(career, target):
                 continue
-            if peak < target["pts"] * .58:
+            if peak < target["pts"] * .40:
                 continue
             profile = phase_for_player(other, phase_key, prepared=metadata)
             if profile:

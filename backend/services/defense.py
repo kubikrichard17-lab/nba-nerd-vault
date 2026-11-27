@@ -90,6 +90,45 @@ def defensive_rates(stat, season):
     return result
 
 
+DEFENSIVE_STYLE_LABEL = {
+    "switchable_wing": "mobilní obousměrný obránce",
+    "mobile_big": "mobilní podkošový obránce",
+    "paint_anchor": "podkošová kotva",
+}
+
+
+def defensive_style(stat, season, height, weight, position, rates):
+    """Typ obrany, nikoli měřená mobilita. Chybějící signál není nula."""
+    from services.shot_context import season_year
+
+    height, weight = optional_number(height), optional_number(weight)
+    if not height or not weight:
+        return None
+    stl, blk = rates.get("stl"), rates.get("blk")
+    drb, orb = optional_number(stat.get("drb_pct")), optional_number(stat.get("orb_pct"))
+    mins, reb = optional_number(stat.get("min_per_game")), optional_number(stat.get("reb"))
+    reb36 = reb * 36 / mins if reb is not None and mins and mins > 0 else None
+    year = season_year(season)
+    big = position == "C" or height >= 207
+    dws = optional_number(stat.get("dws"))
+    if year is not None and year < 1973 and big and (
+        (reb36 is not None and reb36 >= 14) or (dws is not None and dws >= 6 and (reb36 or 0) >= 10)
+    ):
+        return "paint_anchor"
+    boards = (drb or 0) >= 21 or (orb or 0) >= 8 or (reb36 or 0) >= 9.5
+    if big and weight >= 120 and boards:
+        return "paint_anchor"
+    if stl is None or blk is None:
+        return None
+    if big and weight >= 115 and boards and (blk >= (4 if rates.get("blk_is_pct") else 2.2)) and stl < 1.5:
+        return "paint_anchor"
+    if big and 103 <= weight < 120 and (blk >= (2.3 if rates.get("blk_is_pct") else 1.2) or ((reb36 or 0) >= 9 and stl >= 1)):
+        return "mobile_big"
+    if height >= 190 and weight < 112 and stl >= 2 and blk >= (0.9 if rates.get("blk_is_pct") else .48):
+        return "switchable_wing"
+    return None
+
+
 def defense_similarity(a, b):
     """Podobnost společně dostupných metrik; vrací i pokrytí obrany."""
     scores = []

@@ -3,7 +3,7 @@ from services import nba_external
 
 KEY = "advanced-nba:v1:"
 BBR_KEY = "advanced-bbr:v1:"
-ADVANCED = ("ast_pct", "usg_pct", "orb_pct", "stl_pct", "blk_pct", "dbpm", "def_rating", "oreb", "trb_pct")
+ADVANCED = ("ast_pct", "usg_pct", "orb_pct", "stl_pct", "blk_pct", "dbpm", "def_rating", "oreb", "trb_pct", "drb_pct", "dws")
 
 
 def revision():
@@ -96,6 +96,11 @@ def enrich(player_id, name, rows, espn_id=None):
                 for k in (*ADVANCED, "ast", "stl", "blk", "fga", "fta", "fg3a"):
                     if row.get(k) is None and source.get(k) is not None:
                         row[k] = optional_number(source[k])
+        from services.shot_context import season_year
+        year = season_year(season)
+        if year is not None and year < 1973:
+            for key in ("stl", "blk", "oreb", "stl_pct", "blk_pct", "orb_pct"):
+                row[key] = None
         result.append(derive_boxscore(row))
     return result
 

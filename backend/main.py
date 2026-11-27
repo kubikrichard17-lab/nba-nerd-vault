@@ -1115,6 +1115,9 @@ def compare_two_players(req: CompareRequest, db: Session = Depends(get_db)):
     # Když je vybraná sezóna, počítá se stejnými parametry, ale z čísel
     # té sezóny (viz _seasonal_comparison).
     unified = _unified_comparison(p1, p2, s1_key, s2_key)
+    for info, profile in ((p1_info, unified["_p1"]), (p2_info, unified["_p2"])):
+        info["height_cm"] = profile["listed_height_cm"]
+        info["weight_kg"] = profile["listed_weight_kg"]
 
     # Tabulka a popisky potřebují podíly bodů z trojek a šestek – ty jsou
     # jen v kariérním profilu z externího zdroje. Bez nich tabulka ukazovala
@@ -1142,8 +1145,8 @@ def compare_two_players(req: CompareRequest, db: Session = Depends(get_db)):
             "id": p1.id,
             "full_name": p1.full_name,
             "position": p1.position,
-            "height_cm": p1.height_cm,
-            "weight_kg": p1.weight_kg,
+            "height_cm": p1_info["height_cm"],
+            "weight_kg": p1_info["weight_kg"],
             "headshot_url": p1.headshot_url,
             "selected_season": stat1["season_id"],
             "stat": stat1,
@@ -1153,8 +1156,8 @@ def compare_two_players(req: CompareRequest, db: Session = Depends(get_db)):
             "id": p2.id,
             "full_name": p2.full_name,
             "position": p2.position,
-            "height_cm": p2.height_cm,
-            "weight_kg": p2.weight_kg,
+            "height_cm": p2_info["height_cm"],
+            "weight_kg": p2_info["weight_kg"],
             "headshot_url": p2.headshot_url,
             "selected_season": stat2["season_id"],
             "stat": stat2,

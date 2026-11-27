@@ -203,10 +203,12 @@ def resolve_id(nba_id: int, name: str = "") -> Optional[int]:
     Přeloží NBA ID hráče na ID v ESPN (jsou jiná: LeBron 2544 → 1966).
 
     Jméno se vezme z registru NBA a dohledá přes vyhledávání ESPN;
-    bere se jen přesná shoda jména v NBA. Když se nenajde, vrátí původní ID.
+    bere se jen ověřená shoda jména; NBA ID není náhradou za ESPN ID.
     """
     if name:
-        return search_athlete(name)
+        from services.advanced_cache import cached_espn_id
+
+        return cached_espn_id(nba_id, name) or search_athlete(name)
 
     def _do() -> int:
         name = None

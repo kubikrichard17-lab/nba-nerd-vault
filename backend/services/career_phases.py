@@ -47,7 +47,7 @@ STAT_KEYS = (
     "ftm",
     "fta",
     "min_per_game", "oreb", "orb_pct", "stl_pct", "blk_pct", "dbpm", "def_rating",
-    "ast_pct", "usg_pct", "trb_pct",
+    "ast_pct", "usg_pct", "trb_pct", "drb_pct", "dws",
 )
 
 

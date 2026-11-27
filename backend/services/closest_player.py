@@ -45,8 +45,9 @@ from services import defense
 from services.similarity_engine import shot_and_creation_features
 
 # Když se změní prompt nebo logika, zvyš číslo – stará cache se přestane používat.
-ENGINE_VERSION = 30
-SIMILARITY_WEIGHTS = {"style": .56, "physical": .11, "stats": .17, "defense": .16}
+ENGINE_VERSION = 31
+MAX_HEIGHT_DIFF_CM = 8.0
+SIMILARITY_WEIGHTS = {"style": .56, "physical": .16, "stats": .12, "defense": .16}
 
 # Kolik kandidátů se AI pošle (víc = horší soustředění, méně = může chybět správný)
 CANDIDATE_LIMIT = 12
@@ -598,6 +599,13 @@ def build_profile(
         "athletic": round(play_style["athletic"], 3),
     }
     features = shot_and_creation_features(stat, season_hint, usage, fg3_pct)
+    defensive_archetype = defense.defensive_style(stat, season_hint, height_cm, weight_kg, pos_type, features["defensive_rates"])
+    reb36 = reb * 36 / mins_raw if mins_raw and stat.get("reb") is not None else None
+    from services.shot_context import season_year
+    year = season_year(season_hint)
+    historical_anchor = defensive_archetype == "paint_anchor" and year is not None and year < 1973
+    if historical_anchor:
+        d_tier = "elite"
     profile["rim_rate"] = features["rim_pressure_index"] or 0.0
     arch = "primary_playmaker" if features["primary_playmaker"] else archetype(profile)
     spatial = _spatial_profile(height_cm, weight_kg, pos_type, features, reb100)
@@ -606,6 +614,11 @@ def build_profile(
     return {
         **features,
         "spatial_profile": spatial,
+        "listed_height_cm": defense.optional_number(height_cm) or None,
+        "defensive_archetype": defensive_archetype,
+        "defensive_archetype_label": defense.DEFENSIVE_STYLE_LABEL.get(defensive_archetype),
+        "historical_anchor": historical_anchor,
+        "reb36": reb36,
         "listed_weight_kg": defense.optional_number(weight_kg) or None,
         "id": player_id,
         "espn_id": stat.get("espn_id"),
@@ -744,6 +757,12 @@ def _similarity(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, float]:
     stats_pct = _stats_similarity(a, b)
 
     defense_pct, coverage = defense.defense_similarity(a.get("defensive_rates", {}), b.get("defensive_rates", {}))
+    if a.get("historical_anchor") or b.get("historical_anchor"):
+        # Doskok je jen historický zástupný ukazatel, ne imputace zisků/bloků.
+        if a.get("defensive_archetype") == b.get("defensive_archetype") == "paint_anchor":
+            gap = _feature_gap(a, b, "reb100")
+            if gap is not None:
+                defense_pct, coverage = max(0., 100 - 8 * gap), .75
     weights = dict(SIMILARITY_WEIGHTS)
     weights["defense"] *= coverage
     weights["style"] += SIMILARITY_WEIGHTS["defense"] - weights["defense"]
@@ -751,10 +770,21 @@ def _similarity(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, float]:
              + weights["stats"] * stats_pct + weights["defense"] * (defense_pct or 0))
     load_gap = _feature_gap(a, b, "on_ball_load")
     pass_gap = _feature_gap(a, b, "pass_to_score")
-    if {a.get("spatial_profile"), b.get("spatial_profile")} & {"heavy_paint", "true_center"} and (
-        "perimeter" in (a.get("spatial_profile"), b.get("spatial_profile"))
-    ):
-        total -= 11.
+    kinds = {a.get("defensive_archetype"), b.get("defensive_archetype")}
+    historical = a.get("historical_anchor") or b.get("historical_anchor")
+    if historical and kinds != {"paint_anchor"}:
+        total -= 14.
+    elif "paint_anchor" in kinds and kinds & {"mobile_big", "switchable_wing"}:
+        total -= 14.
+    elif "paint_anchor" in kinds and "perimeter" in (a.get("spatial_profile"), b.get("spatial_profile")) and not both_centers(a,b):
+        total -= 12.
+    elif "switchable_wing" in kinds and None in kinds and defense_pct is not None:
+        # Rozliš podobnost v obraně od samotného rozdílu v četnosti zisků.
+        observed = [p.get("defensive_rates", {}).get("stl") for p in (a,b)]
+        if all(x is not None for x in observed) and min(observed) < 1.5:
+            total -= min(6., max(0., (75 - defense_pct) * .22))
+    if not compatible_dimensions(a, b) and a.get("listed_height_cm") and b.get("listed_height_cm"):
+        total -= min(25., 1.25 * max(0., _height_gap_cm(a,b) - MAX_HEIGHT_DIFF_CM))
     if both_centers(a, b):
         gap = _feature_gap(a, b, "listed_weight_kg")
         if gap is not None:
@@ -777,15 +807,27 @@ def _feature_gap(a, b, key):
 
 def _style_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     scores = []
+    historical_pair = (a.get("historical_anchor") or b.get("historical_anchor")) and (
+        a.get("defensive_archetype") == b.get("defensive_archetype") == "paint_anchor")
     for key, weight, scale in (
         ("rel_3par", 13, .48), ("three_efficiency", 14, .20),
         ("rim_pressure_index", 21, .62), ("mid_range_index", 10, .65),
         ("on_ball_load", 20, .66), ("pass_to_score", 11, .5),
         ("ft_pct", 8, .25), ("ftr", 3, .56),
     ):
+        if historical_pair and key in ("rel_3par", "three_efficiency", "rim_pressure_index", "mid_range_index", "ftr"):
+            continue
         gap = _feature_gap(a, b, key)
         if gap is not None:
             scores.append((weight, max(0., 1 - gap / scale)))
+    if historical_pair:
+        gap = _feature_gap(a, b, "reb100")
+        if gap is not None:
+            scores.append((42, max(0., 1 - gap / 10)))
+    if a.get("defensive_archetype") == b.get("defensive_archetype") == "mobile_big":
+        vertical = _feature_gap(a, b, "vertical_athleticism")
+        if vertical is not None:
+            scores.append((10, max(0., 1 - vertical / .5)))
     if a.get("spatial_profile") in ("heavy_paint", "true_center") and b.get("spatial_profile") in ("heavy_paint", "true_center"):
         gap = _feature_gap(a, b, "orb_signal")
         if gap is not None:
@@ -812,6 +854,13 @@ def both_centers(a, b):
     return all(p.get("spatial_profile") in ("heavy_paint", "true_center") for p in (a, b))
 
 
+def compatible_dimensions(a, b):
+    ha, hb = a.get("listed_height_cm"), b.get("listed_height_cm")
+    if not ha or not hb:
+        return False
+    return abs(ha-hb) <= (10. if min(ha,hb) > 206 else MAX_HEIGHT_DIFF_CM) + 1e-9
+
+
 def _physical_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     """Výška, váha a atletičnost – jak moc jsou si hráči tělesně podobní."""
     height_gap = abs(_num(a.get("height_cm"), 198.0) - _num(b.get("height_cm"), 198.0))
@@ -822,6 +871,14 @@ def _physical_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     centers = both_centers(a, b)
     if a.get("listed_weight_kg") and b.get("listed_weight_kg"):
         score -= min(weight_gap * (.95 if centers else .55), 38. if centers else 30.)
+    groups = {a.get("role_group"), b.get("role_group")}
+    if groups == {"guard", "big"}:
+        score -= 27
+    elif groups == {"guard", "wing"}:
+        # Shodný vysoký tvůrce útoku nepřestává být podobný kvůli štítku SG/SF.
+        score -= 0 if a.get("primary_playmaker") and b.get("primary_playmaker") else 7
+    elif groups == {"big", "wing"} and not both_centers(a,b):
+        score -= 8
     return _clamp(score)
 
 
@@ -1549,14 +1606,20 @@ def resolve_cached(target: Dict[str, Any], pool: List[Dict[str, Any]]) -> Option
     if not target.get("pts"):
         return None
     def eligible(c):
-        if same_player(target, c) or not c.get("pts") or _height_gap_cm(target, c) > 12:
+        if same_player(target, c) or not c.get("pts") or not compatible_dimensions(target, c):
             return False
+        # U všestranných obránců je role důležitější než nízký objem bodů.
+        dual_wings = (target.get("defensive_archetype") == c.get("defensive_archetype") == "switchable_wing")
+        if {target.get("role_group"), c.get("role_group")} == {"guard", "big"}:
+            return False
+        anchors = target.get("defensive_archetype") == c.get("defensive_archetype") == "paint_anchor"
         gap = _feature_gap(target, c, "rel_3par")
         limit = .28 if both_centers(target, c) else .20
-        if gap is not None and gap > limit + 1e-9:
+        historical_pair = anchors and (target.get("historical_anchor") or c.get("historical_anchor"))
+        if gap is not None and gap > limit + 1e-9 and not historical_pair:
             return False
         ratio = min(c["pts"], target["pts"]) / max(c["pts"], target["pts"])
-        return ratio >= .65 or (ratio >= .58 and _style_similarity(target, c) > 82)
+        return ratio >= .65 or ((anchors or dual_wings) and ratio >= .40) or (ratio >= .58 and _style_similarity(target, c) > 82)
 
     candidates = [c for c in pool if eligible(c)]
     if not candidates:
