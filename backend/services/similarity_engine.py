@@ -234,10 +234,18 @@ def shot_and_creation_features(stat, season, usage, three_efficiency=None):
     vertical_index = sum(v * w for v, w in observed) / sum(w for _, w in observed) if len(observed) >= 2 else None
     primary = (ast_pct >= 35 and usg_pct >= 30) if ast_pct is not None and usg_pct is not None else (
         load is not None and load >= .76 and ast is not None and fga and ast/fga >= .35)
+    pct_0_3 = num(stat.get("pct_fga_0_3"))
+    pct_mid = num(stat.get("pct_fga_mid"))
+    pct_3p = num(stat.get("pct_fga_3p"))
+    if pct_0_3 is not None:
+        rim = 0.65 * unit(pct_0_3 / 0.65) + 0.35 * rim if rim is not None else unit(pct_0_3 / 0.65)
+    if pct_mid is not None:
+        mid = 0.65 * unit(pct_mid / 0.55) + 0.35 * mid if mid is not None else unit(pct_mid / 0.55)
     return {"primary_playmaker": bool(primary), "vertical_athleticism": vertical_index,
             "orb_signal": board, "trb_pct": num(stat.get("trb_pct")), "ftr": ftr,
             "on_ball_load": load, "pass_to_score": ast / fga if ast is not None and fga else None,
             "rim_pressure_index": rim, "mid_range_index": mid,
+            "pct_fga_0_3": pct_0_3, "pct_fga_mid": pct_mid, "pct_fga_3p": pct_3p,
             "rel_3par": relative_three,
             "three_efficiency": three_efficiency if fg3a and fg3a >= 1 and (stat.get("fg3m") is not None or stat.get("fg3_pct") is not None) else None,
             "defensive_rates": rates, "defense_missing": any(rates[k] is None for k in ("dbpm", "def_rating"))}

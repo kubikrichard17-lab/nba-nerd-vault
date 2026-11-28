@@ -109,18 +109,21 @@ def defensive_style(stat, season, height, weight, position, rates):
     mins, reb = optional_number(stat.get("min_per_game")), optional_number(stat.get("reb"))
     reb36 = reb * 36 / mins if reb is not None and mins and mins > 0 else None
     year = season_year(season)
-    big = position == "C" or height >= 207
+    big = position == "C" or height >= 205
     dws = optional_number(stat.get("dws"))
     if year is not None and year < 1973 and big and (
         (reb36 is not None and reb36 >= 14) or (dws is not None and dws >= 6 and (reb36 or 0) >= 10)
     ):
         return "paint_anchor"
-    boards = (drb or 0) >= 21 or (orb or 0) >= 8 or (reb36 or 0) >= 9.5
+    trb = optional_number(stat.get("trb_pct"))
+    boards = (drb or 0) >= 21 or (orb or 0) >= 8 or (trb or 0) >= 17 or (reb36 or 0) >= 9.5
     if big and weight >= 120 and boards:
         return "paint_anchor"
     if stl is None or blk is None:
         return None
-    if big and weight >= 115 and boards and (blk >= (4 if rates.get("blk_is_pct") else 2.2)) and stl < 1.5:
+    if big and boards and (blk >= (4 if rates.get("blk_is_pct") else 2.2)) and (
+        (stl < 1.8 and weight >= 115) or (trb or 0) >= 17.5 or (reb36 or 0) >= 11.5
+    ):
         return "paint_anchor"
     if big and 103 <= weight < 120 and (blk >= (2.3 if rates.get("blk_is_pct") else 1.2) or ((reb36 or 0) >= 9 and stl >= 1)):
         return "mobile_big"
@@ -132,11 +135,16 @@ def defensive_style(stat, season, height, weight, position, rates):
 def defense_similarity(a, b):
     """Podobnost společně dostupných metrik; vrací i pokrytí obrany."""
     scores = []
-    for k, weight, scale in (("stl", .43, 2.0), ("blk", .37, 2.0),
-                             ("dbpm", .14, 5.0), ("def_rating", .06, 12.0)):
+    for k, weight, default_scale in (("stl", .43, 3.5), ("blk", .37, 2.6),
+                                     ("dbpm", .14, 5.0), ("def_rating", .06, 12.0)):
         x, y = a.get(k), b.get(k)
+        scale = default_scale
         if k in ("stl", "blk") and a.get(k + "_is_pct") != b.get(k + "_is_pct"):
             x, y = a.get(k + "100"), b.get(k + "100")
+        elif k == "stl" and a.get("stl_is_pct") and b.get("stl_is_pct"):
+            scale = 3.2
+        elif k == "blk" and a.get("blk_is_pct") and b.get("blk_is_pct"):
+            scale = 3.6
         if x is not None and y is not None:
             scores.append((weight, max(0., 100. * (1 - abs(x - y) / scale))))
     coverage = sum(w for w, _ in scores)

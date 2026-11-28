@@ -45,9 +45,9 @@ from services import defense
 from services.similarity_engine import shot_and_creation_features
 
 # Když se změní prompt nebo logika, zvyš číslo – stará cache se přestane používat.
-ENGINE_VERSION = 31
+ENGINE_VERSION = 34
 MAX_HEIGHT_DIFF_CM = 8.0
-SIMILARITY_WEIGHTS = {"style": .56, "physical": .16, "stats": .12, "defense": .16}
+SIMILARITY_WEIGHTS = {"style": .54, "physical": .17, "stats": .14, "defense": .15}
 
 # Kolik kandidátů se AI pošle (víc = horší soustředění, méně = může chybět správný)
 CANDIDATE_LIMIT = 12
@@ -506,7 +506,9 @@ def build_profile(
     usage = _clamp(((fga + 0.44 * fta + tov) * 48.0 / minutes) / 100.0, 0.08, 0.45)
     from services.advanced_cache import derive_boxscore
 
-    ts = defense.optional_number(derive_boxscore(stat, include_rates=False).get("ts"))
+    ts = defense.optional_number(stat.get("ts_pct"))
+    if ts is None:
+        ts = defense.optional_number(derive_boxscore(stat, include_rates=False).get("ts"))
 
     # Odkud hráč skóruje: pod košem (2PT) vs. za trojkou. Tohle rozliší
     # Giannise (91 % střel za dva) od Duranta (73 %), i když mají stejná
@@ -632,6 +634,7 @@ def build_profile(
         "stl": stl,
         "blk": blk,
         "tov": tov,
+        "min_per_game": _num(stat.get("min_per_game")),
         "fga": fga,
         "fg3a": fg3a,
         "fg3m": fg3m,
@@ -774,9 +777,10 @@ def _similarity(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, float]:
     historical = a.get("historical_anchor") or b.get("historical_anchor")
     if historical and kinds != {"paint_anchor"}:
         total -= 14.
-    elif "paint_anchor" in kinds and kinds & {"mobile_big", "switchable_wing"}:
+    rebound_pair = min(_num(a.get("reb")), _num(b.get("reb"))) >= 11.0 and max(a.get("three_rate", 0), b.get("three_rate", 0)) < 0.12
+    if "paint_anchor" in kinds and kinds & {"mobile_big", "switchable_wing"}:
         total -= 14.
-    elif "paint_anchor" in kinds and "perimeter" in (a.get("spatial_profile"), b.get("spatial_profile")) and not both_centers(a,b):
+    elif (not rebound_pair) and ("heavy_paint" in (a.get("spatial_profile"), b.get("spatial_profile")) or "true_center" in (a.get("spatial_profile"), b.get("spatial_profile"))) and "perimeter" in (a.get("spatial_profile"), b.get("spatial_profile")) and not both_centers(a, b):
         total -= 12.
     elif "switchable_wing" in kinds and None in kinds and defense_pct is not None:
         # Rozliš podobnost v obraně od samotného rozdílu v četnosti zisků.
@@ -785,10 +789,6 @@ def _similarity(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, float]:
             total -= min(6., max(0., (75 - defense_pct) * .22))
     if not compatible_dimensions(a, b) and a.get("listed_height_cm") and b.get("listed_height_cm"):
         total -= min(25., 1.25 * max(0., _height_gap_cm(a,b) - MAX_HEIGHT_DIFF_CM))
-    if both_centers(a, b):
-        gap = _feature_gap(a, b, "listed_weight_kg")
-        if gap is not None:
-            total -= min(9., .8 * max(0., gap - 22.))
     total -= min(8., 16 * max(0., (load_gap or 0) - .13) + 12 * max(0., (pass_gap or 0) - .16))
     return {
         "match_pct": round(_clamp(total), 1),
@@ -810,16 +810,25 @@ def _style_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     historical_pair = (a.get("historical_anchor") or b.get("historical_anchor")) and (
         a.get("defensive_archetype") == b.get("defensive_archetype") == "paint_anchor")
     for key, weight, scale in (
-        ("rel_3par", 13, .48), ("three_efficiency", 14, .20),
-        ("rim_pressure_index", 21, .62), ("mid_range_index", 10, .65),
-        ("on_ball_load", 20, .66), ("pass_to_score", 11, .5),
-        ("ft_pct", 8, .25), ("ftr", 3, .56),
+        ("rel_3par", 8, .55), ("three_efficiency", 14, .20),
+        ("three_pts_share", 12, .25),
+        ("rim_pressure_index", 16, .62), ("pct_fga_0_3", 28, .22),
+        ("mid_range_index", 8, .65), ("pct_fga_mid", 8, .35),
+        ("on_ball_load", 20, .66), ("pass_to_score", 15 if not both_centers(a, b) else 8, .40 if not both_centers(a, b) else .50),
+        ("ft_pct", 10, .20), ("ftr", 3, .56),
     ):
-        if historical_pair and key in ("rel_3par", "three_efficiency", "rim_pressure_index", "mid_range_index", "ftr"):
+        if historical_pair and key in ("rel_3par", "three_efficiency", "three_pts_share", "rim_pressure_index", "pct_fga_0_3", "mid_range_index", "pct_fga_mid", "ftr"):
             continue
         gap = _feature_gap(a, b, key)
         if gap is not None:
-            scores.append((weight, max(0., 1 - gap / scale)))
+            s = max(0., 1 - gap / scale)
+            if key == "pct_fga_0_3" and both_centers(a, b) and min(a.get("pct_fga_0_3") or 0, b.get("pct_fga_0_3") or 0) >= 0.45:
+                s = max(s, 0.92)
+            scores.append((weight, s))
+    reb_gap = _feature_gap(a, b, "reb100")
+    if reb_gap is not None and (min(a.get("pts", 20), b.get("pts", 20)) < 14 or max(a.get("reb", 0), b.get("reb", 0)) >= 11):
+        reb_w = 30 if max(a.get("reb", 0), b.get("reb", 0)) >= 12.0 and min(a.get("pts", 20), b.get("pts", 20)) < 14 else 18
+        scores.append((reb_w, max(0., 1 - reb_gap / 7.5)))
     if historical_pair:
         gap = _feature_gap(a, b, "reb100")
         if gap is not None:
@@ -832,6 +841,8 @@ def _style_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
         gap = _feature_gap(a, b, "orb_signal")
         if gap is not None:
             scores.append((9, max(0., 1 - gap / .72)))
+        if a.get("defensive_archetype") == b.get("defensive_archetype") == "paint_anchor" and max(a.get("three_rate", 0), b.get("three_rate", 0)) < 0.04:
+            scores.append((24, 1.0))
     style = 100 * sum(w * score for w, score in scores) / sum(w for w, _ in scores) if scores else 0.
     # Dvě křídla s podobným skórováním nemusí stejně často řídit útok.
     load_gap = _feature_gap(a, b, "on_ball_load")
@@ -858,7 +869,9 @@ def compatible_dimensions(a, b):
     ha, hb = a.get("listed_height_cm"), b.get("listed_height_cm")
     if not ha or not hb:
         return False
-    return abs(ha-hb) <= (10. if min(ha,hb) > 206 else MAX_HEIGHT_DIFF_CM) + 1e-9
+    if both_centers(a, b) or (a.get("role_group") == "big" and b.get("role_group") == "big" and min(ha, hb) >= 204):
+        return abs(ha - hb) <= 14.0 + 1e-9
+    return abs(ha - hb) <= (10. if min(ha, hb) > 206 else MAX_HEIGHT_DIFF_CM) + 1e-9
 
 
 def _physical_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
@@ -867,10 +880,11 @@ def _physical_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     weight_gap = abs(_num(a.get("weight_kg"), 95.0) - _num(b.get("weight_kg"), 95.0))
 
     score = 100.0
-    score -= min(height_gap * 1.9, 45.0)
     centers = both_centers(a, b)
+    heavy_centers = centers and min(_num(a.get("weight_kg")), _num(b.get("weight_kg"))) >= 115.0
+    score -= min(height_gap * (0.7 if heavy_centers else 1.1 if centers else 1.9), 45.0)
     if a.get("listed_weight_kg") and b.get("listed_weight_kg"):
-        score -= min(weight_gap * (.95 if centers else .55), 38. if centers else 30.)
+        score -= min(weight_gap * (.35 if heavy_centers else .45 if centers else .55), 22. if centers else 30.)
     groups = {a.get("role_group"), b.get("role_group")}
     if groups == {"guard", "big"}:
         score -= 27
@@ -884,10 +898,12 @@ def _physical_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
 
 def _stats_similarity(a: Dict[str, Any], b: Dict[str, Any]) -> float:
     """Statistický dopad: body, doskoky, asistence, obrana a efektivita."""
+    both_anchors = both_centers(a, b) and a.get("defensive_archetype") == b.get("defensive_archetype") == "paint_anchor"
+    high_reb = max(_num(a.get("reb")), _num(b.get("reb"))) >= 11.0
     pairs = [
-        ("pts", 2.6),
-        ("reb", 1.8),
-        ("ast", 1.8),
+        ("pts", 0.8 if both_anchors else 2.6),
+        ("reb", 4.2 if high_reb else 1.8),
+        ("ast", 0.8 if both_anchors else 1.8),
         ("ts", 5.0),
         ("fg3a", 1.0 if a.get("three_rate", 0) > .40 and b.get("three_rate", 0) > .40 else 0.0),
     ]
@@ -1601,27 +1617,41 @@ def same_player(a, b):
             or bool(a.get("espn_id") and str(a["espn_id"]) == str(b.get("espn_id"))))
 
 
+def is_eligible_candidate(target: Dict[str, Any], c: Dict[str, Any]) -> bool:
+    if same_player(target, c) or not c.get("pts") or not compatible_dimensions(target, c):
+        return False
+    t_mpg = _num(target.get("min_per_game"))
+    c_mpg = _num(c.get("min_per_game"))
+    if t_mpg >= 26.0 and c_mpg > 0 and c_mpg < max(22.0, 0.65 * t_mpg):
+        return False
+    # U všestranných obránců je role důležitější než nízký objem bodů.
+    dual_wings = (target.get("defensive_archetype") == c.get("defensive_archetype") == "switchable_wing")
+    if {target.get("role_group"), c.get("role_group")} == {"guard", "big"}:
+        return False
+    anchors = target.get("defensive_archetype") == c.get("defensive_archetype") == "paint_anchor"
+    rebounders = min(_num(target.get("reb")), _num(c.get("reb"))) >= 10.5 and max(_num(target.get("pts")), _num(c.get("pts"))) < 22.0
+    if both_centers(target, c) and min(target.get("three_rate", 0), c.get("three_rate", 0)) < 0.02 and max(target.get("three_rate", 0), c.get("three_rate", 0)) > 0.12:
+        return False
+    gap = _feature_gap(target, c, "rel_3par")
+    limit = .26 if not both_centers(target, c) else .28
+    historical_pair = anchors and (target.get("historical_anchor") or c.get("historical_anchor"))
+    if gap is not None and gap > limit + 1e-9 and not historical_pair:
+        return False
+    ratio = min(c["pts"], target["pts"]) / max(c["pts"], target["pts"])
+    min_ratio = .72 if target.get("tier") == "superstar" else .65
+    return (
+        ratio >= min_ratio
+        or ((anchors or rebounders) and ratio >= .35)
+        or (dual_wings and ratio >= (.58 if target["pts"] >= 25.0 else .45))
+        or (target.get("tier") != "superstar" and ratio >= .58 and _style_similarity(target, c) > 82)
+    )
+
+
 def resolve_cached(target: Dict[str, Any], pool: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """Pořadí podle role a střelby, uvnitř nejbližší skupiny podle shody."""
     if not target.get("pts"):
         return None
-    def eligible(c):
-        if same_player(target, c) or not c.get("pts") or not compatible_dimensions(target, c):
-            return False
-        # U všestranných obránců je role důležitější než nízký objem bodů.
-        dual_wings = (target.get("defensive_archetype") == c.get("defensive_archetype") == "switchable_wing")
-        if {target.get("role_group"), c.get("role_group")} == {"guard", "big"}:
-            return False
-        anchors = target.get("defensive_archetype") == c.get("defensive_archetype") == "paint_anchor"
-        gap = _feature_gap(target, c, "rel_3par")
-        limit = .28 if both_centers(target, c) else .20
-        historical_pair = anchors and (target.get("historical_anchor") or c.get("historical_anchor"))
-        if gap is not None and gap > limit + 1e-9 and not historical_pair:
-            return False
-        ratio = min(c["pts"], target["pts"]) / max(c["pts"], target["pts"])
-        return ratio >= .65 or ((anchors or dual_wings) and ratio >= .40) or (ratio >= .58 and _style_similarity(target, c) > 82)
-
-    candidates = [c for c in pool if eligible(c)]
+    candidates = [c for c in pool if is_eligible_candidate(target, c)]
     if not candidates:
         return None
     ranked = sorted(candidates, key=lambda c: (-_similarity(target, c)["match_pct"], c["id"]))

@@ -4,7 +4,7 @@
 chcp 65001 >nul
 cd /d "%~dp0"
 
-set REPO=https://github.com/TVUJ-UCET/nba-nerd-vault.git
+set REPO=https://github.com/kubikrichard17-lab/nba-nerd-vault.git
 
 echo.
 echo  ==========================================

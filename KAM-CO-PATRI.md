@@ -21,7 +21,7 @@ Dělá se to takhle:
 
 1. Na GitHubu vytvoř **prázdný** repozitář (bez README, bez .gitignore).
 2. Otevři soubor **`NAHRAT-NA-GITHUB.bat`** v té složce (dvojklik).
-3. Než ho spustíš, přepiš v něm `TVUJ-UCET` na svoje jméno na GitHubu.
+3. Repozitář je už založený a nahraný – adresa je v souboru vyplněná.
 4. Hotovo – projekt je na GitHubu.
 
 Co se **nenahraje**, protože je to velké nebo tajné (hlídá to `.gitignore`):

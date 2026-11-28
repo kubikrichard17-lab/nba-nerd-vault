@@ -29,12 +29,12 @@ git init
 git add .
 git commit -m "NBA Nerd Vault – první nahrání"
 git branch -M main
-git remote add origin https://github.com/TVUJ-UCET/nba-nerd-vault.git
+git remote add origin https://github.com/kubikrichard17-lab/nba-nerd-vault.git
 git push -u origin main
 ```
 
-`TVUJ-UCET` nahraď svým jménem na GitHubu. Repozitář si předtím vytvoř na
-GitHubu jako **prázdný** (bez README, bez .gitignore).
+Repozitář už je založený: **https://github.com/kubikrichard17-lab/nba-nerd-vault**
+(včetně nahraných souborů), takže tenhle krok dělat nemusíš.
 
 Co se nahraje a co ne, hlídá `.gitignore` v kořeni:
 
